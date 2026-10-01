@@ -37,7 +37,7 @@ const getSuggestedQuestions = (route: string, view: string) => {
 };
 
 export function CopilotSheet() {
-  const { isOpen, setIsOpen, messages, addMessage, activeRoute, activeView, draftSelections, setIsStreaming, tripId } = useCopilotStore();
+  const { isOpen, setIsOpen, messages, addMessage, activeRoute, activeView, draftSelections, setIsStreaming, tripId, documentContext } = useCopilotStore();
   const { jettyState } = useJettyState();
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
@@ -101,7 +101,8 @@ export function CopilotSheet() {
           context: JSON.stringify({
             activeRoute,
             activeView,
-            draftSelections
+            draftSelections,
+            documentContext
           })
         }),
         onmessage(ev) {
