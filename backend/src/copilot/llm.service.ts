@@ -24,7 +24,7 @@ export class LlmService {
         {
           messages: [
             { role: 'system', content: systemPrompt },
-            ...messages,
+            ...messages.map(m => ({ ...m, role: m.role === 'model' ? 'assistant' : m.role })),
           ],
           model: 'openai/gpt-oss-120b',
           stream: true,

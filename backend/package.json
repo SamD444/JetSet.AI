@@ -20,6 +20,7 @@
     "test:e2e": "jest --config ./test/jest-e2e.json"
   },
   "dependencies": {
+    "@google/genai": "^2.25.0",
     "@nestjs/axios": "^4.0.1",
     "@nestjs/cache-manager": "^3.1.0",
     "@nestjs/common": "^11.0.1",
@@ -27,14 +28,18 @@
     "@nestjs/core": "^11.0.1",
     "@nestjs/platform-express": "^11.0.1",
     "@nestjs/typeorm": "^11.0.0",
+    "@types/multer": "^2.3.0",
+    "@zxing/library": "^0.21.3",
     "axios": "^1.13.6",
     "cache-manager": "^7.2.8",
     "groq-sdk": "^1.6.0",
     "jsonwebtoken": "^9.0.3",
     "keyv": "^5.6.0",
+    "pdf-parse": "^2.4.5",
     "pg": "^8.20.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
+    "sharp": "^0.35.5",
     "typeorm": "^0.3.28"
   },
   "devDependencies": {
@@ -61,7 +66,8 @@
     "ts-node": "^10.9.2",
     "tsconfig-paths": "^4.2.0",
     "typescript": "^5.7.3",
-    "typescript-eslint": "^8.20.0"
+    "typescript-eslint": "^8.20.0",
+    "webpack": "^5.111.1"
   },
   "jest": {
     "moduleFileExtensions": [

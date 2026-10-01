@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 
 export interface OpenRouterMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  content: string | any[];
 }
 
 @Injectable()

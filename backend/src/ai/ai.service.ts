@@ -6,7 +6,9 @@ import { TripsService } from '../trips/trips.service';
 import { RagService } from '../rag/rag.service';
 import { normalizeAndHash } from '../common/normalize';
 import { OpenRouterService, OpenRouterMessage } from '../openrouter/openrouter.service';
-
+import { GoogleGenAI } from '@google/genai';
+// @ts-ignore
+import { MultiFormatReader, RGBLuminanceSource, BinaryBitmap, HybridBinarizer } from '@zxing/library';
 export interface ItineraryStopDto {
   city: string;
   dayStart: number;
@@ -389,6 +391,7 @@ Example:
   async getChatStream(
     tripId: string, 
     messages: { role: 'user' | 'model'; content: string }[], 
+    context: any,
     onChunk: (text: string) => void, 
     onComplete: () => void
   ) {
@@ -548,11 +551,15 @@ Example:
       ? `The user's selected interests are: ${trip.interests.join(', ')}.`
       : `The user did not specify interests.`;
 
+    const uploadedDocText = context?.documentContext 
+      ? `\nUser's uploaded travel document (highly relevant): \n${context.documentContext}` 
+      : '';
+
     const systemInstruction = `
 You are JetSet.AI, a smart, conversational travel assistant. 
 The user is planning a trip to ${trip.destination}.
 Current Trip context: Origin=${trip.origin || 'Unknown'}, Dates=${trip.fromDate || ''} to ${trip.toDate || ''}, Budget=${trip.budget || ''}, Companions=${trip.companions || ''}.
-${tripInterests}
+${tripInterests}${uploadedDocText}
 
 Conversation Guidelines:
 1. Be natural, friendly, and brief. Answer only what the user asks directly.
@@ -622,6 +629,181 @@ ${contextString}
     }
 
     onComplete();
+  }
+
+  private async decodeBarcode(buffer: Buffer, mimetype: string): Promise<string | null> {
+    if (!mimetype.startsWith('image/')) return null;
+    try {
+      // @ts-ignore
+      const nodeRequire = typeof __non_webpack_require__ !== 'undefined' ? __non_webpack_require__ : require;
+      const sharp = nodeRequire('sharp');
+      const { data, info } = await sharp(buffer)
+        .ensureAlpha()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+        
+      const source = new RGBLuminanceSource(new Uint8ClampedArray(data), info.width, info.height);
+      const bitmap = new BinaryBitmap(new HybridBinarizer(source));
+      const reader = new MultiFormatReader();
+      const result = reader.decode(bitmap);
+      return result.getText();
+    } catch (e: any) {
+      // zxing throws an error if barcode not found.
+      return null;
+    }
+  }
+
+  async processTravelDocument(file: Express.Multer.File) {
+    const barcodeStr = await this.decodeBarcode(file.buffer, file.mimetype);
+    let extractedText = '';
+    
+    // Attempt text extraction for context
+    if (file.mimetype === 'application/pdf') {
+      try {
+        // @ts-ignore
+        const nodeRequire = typeof __non_webpack_require__ !== 'undefined' ? __non_webpack_require__ : require;
+        const pdfParse = nodeRequire('pdf-parse');
+        const pdfData = await pdfParse(file.buffer);
+        extractedText = pdfData.text;
+      } catch (err: any) {
+        this.logger.warn(`PDF parsing failed: ${err.message}`);
+      }
+    } else if (!file.mimetype.startsWith('image/')) {
+      extractedText = file.buffer.toString('utf-8');
+    }
+
+    try {
+      let response: string;
+
+      if (barcodeStr) {
+        this.logger.log(`Barcode detected: ${barcodeStr}`);
+        const bcPrompt = `You are a travel document analyzer. 
+I have scanned a barcode from a boarding pass and extracted the following raw IATA BCBP string:
+${barcodeStr}
+
+Return ONLY a JSON object with this exact structure:
+{
+  "isValidTravelDocument": true,
+  "rejectReason": "",
+  "origin": "string (IATA code or city)",
+  "destination": "string (IATA code or city)",
+  "fromDate": "YYYY-MM-DD (or empty)",
+  "toDate": "YYYY-MM-DD (or empty)",
+  "extractedText": "Parsed boarding pass details",
+  "landmarks": [],
+  "semanticVibe": "flight"
+}`;
+        response = await this.callModelWithFallback(bcPrompt, 'You are a boarding pass barcode analyzer.', true);
+      } else {
+        const prompt = `You are a travel document analyzer for JetSet.AI. 
+Analyze the following document (text or image/pdf) and extract travel metadata.
+STRICT VALIDATION: Evaluate if this is a legitimate travel document (e.g., flight ticket, hotel booking, itinerary, tourist brochure, visa, or event pass). If it is a generic photo (like a selfie, a screenshot of a conversation, or a grocery receipt) with NO travel context, you MUST set isValidTravelDocument to false and provide a polite rejectReason.
+
+Document Text (if any):
+${extractedText.substring(0, 5000)}
+
+Return ONLY a JSON object with this exact structure:
+{
+  "isValidTravelDocument": boolean,
+  "rejectReason": "string (polite error message if invalid, else empty)",
+  "origin": "string (or empty)",
+  "destination": "string (or empty)",
+  "fromDate": "YYYY-MM-DD (or empty)",
+  "toDate": "YYYY-MM-DD (or empty)",
+  "extractedText": "string (a rich summary of the context, e.g., flight numbers, hotel names, specific activities)",
+  "landmarks": ["string"],
+  "semanticVibe": "string (e.g., 'luxury couples retreat', 'budget backpacking', 'cultural family trip')"
+}`;
+
+        const geminiKey = this.configService.get<string>('GEMINI_API_KEY');
+        if (geminiKey && (file.mimetype.startsWith('image/') || file.mimetype === 'application/pdf')) {
+          const ai = new GoogleGenAI({ apiKey: geminiKey });
+          const geminiModels = ['gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-3.6-flash'];
+          let geminiSuccess = false;
+
+          for (const model of geminiModels) {
+            for (let attempt = 0; attempt < 2; attempt++) {
+              try {
+                this.logger.log(`Calling Gemini Vision (${model}, attempt ${attempt + 1}) for ${file.mimetype}...`);
+                const result = await ai.models.generateContent({
+                  model,
+                  contents: [
+                    prompt,
+                    {
+                      inlineData: {
+                        data: file.buffer.toString('base64'),
+                        mimeType: file.mimetype
+                      }
+                    }
+                  ]
+                });
+                response = result.text || '';
+                geminiSuccess = true;
+                break;
+              } catch (e: any) {
+                const is503 = e.message?.includes('503') || e.message?.includes('UNAVAILABLE') || e.message?.includes('high demand');
+                this.logger.warn(`Gemini ${model} attempt ${attempt + 1} failed: ${e.message}`);
+                if (is503 && attempt === 0) {
+                  await new Promise(r => setTimeout(r, 2000));
+                  continue;
+                }
+                break; // non-503 error or second attempt, try next model
+              }
+            }
+            if (geminiSuccess) break;
+          }
+
+          if (!geminiSuccess) {
+            this.logger.warn('All Gemini models unavailable, falling back to Groq text fallback...');
+            response = await this.callModelWithFallback(prompt, 'You are a multimodal travel document analyzer.', true);
+          }
+        } else {
+          response = await this.callModelWithFallback(prompt, 'You are a multimodal travel document analyzer.', true);
+        }
+      }
+      
+      const cleanJson = response.replace(/```json/g, '').replace(/```/g, '').trim();
+      const metadata = JSON.parse(cleanJson);
+      
+      if (!metadata.isValidTravelDocument) {
+        return {
+          isValidTravelDocument: false,
+          error: metadata.rejectReason || 'This document does not appear to be travel-related. Please upload a valid itinerary, booking, or brochure.'
+        };
+      }
+      
+      let enhancedDocumentContext = metadata.extractedText;
+      let retrievedInventory: string[] = [];
+
+      if (metadata.semanticVibe) {
+        const query = `${metadata.semanticVibe} ${metadata.extractedText}`;
+        retrievedInventory = await this.ragService.retrieveContext(query, 3);
+        
+        if (retrievedInventory.length > 0) {
+           enhancedDocumentContext += `\n\nMatching Inventory retrieved based on vibe (${metadata.semanticVibe}):\n` + retrievedInventory.join('\n\n');
+        }
+      }
+
+      const greetingPrompt = `Write a short, friendly 1-2 sentence greeting acknowledging the uploaded travel document for ${metadata.destination || 'a trip'}. Mention the vibe (${metadata.semanticVibe}). Example: "I see you uploaded a brochure for Kyoto! I've set up a 5-day itinerary based on it." No markdown, just plain text.`;
+      
+      let proactiveMessage = `I see you uploaded a travel document! I've noted the details and set up some recommendations based on it.`;
+      try {
+        proactiveMessage = await this.callModelWithFallback(greetingPrompt, "You are a friendly travel assistant.");
+      } catch(e) {}
+      
+      return {
+        ...metadata,
+        documentContext: enhancedDocumentContext,
+        proactiveMessage
+
+      };
+    } catch (err: any) {
+      this.logger.error(`Document processing failed: ${err.message}`);
+      return {
+        isValidTravelDocument: false,
+        error: `The OpenRouter model encountered an error processing this file. Note: openrouter/free may not support images or strict JSON formatting. (${err.message})`
+      };
+    }
   }
 
   private classifyQuery(q: string): 'easy' | 'medium' | 'complex' {
@@ -886,7 +1068,7 @@ We are sincerely sorry, but our seasonal AI advisor is temporarily offline.
             stream: true,
             messages: [
               { role: 'system', content: system },
-              ...contents.map(c => ({ role: c.role, content: c.parts?.[0]?.text || c.content || '' }))
+              ...contents.map(c => ({ role: c.role === 'model' ? 'assistant' : c.role, content: c.parts?.[0]?.text || c.content || '' }))
             ]
           })
         });
@@ -978,7 +1160,7 @@ We are sincerely sorry, but our seasonal AI advisor is temporarily offline.
     const mockSummary = `
 ### Welcome to your blueprint for **${trip.destination}**!
 
-You are embarking on a **${trip.budget}** trip from **${trip.origin}** as a **${trip.companions}**. We have aggregated travel guides matching your interests in **${trip.interests.join(', ')}** to customize this adventure.
+You are embarking on a **${trip.budget}** trip from **${trip.origin}** as a **${trip.companions}**. We have aggregated travel guides matching your interests in **${Array.isArray(trip.interests) ? trip.interests.join(', ') : 'General Travel'}** to customize this adventure.
 
 #### 📍 Local Highlights & Insights
 Based on our guide context, if you are visiting, make sure to explore the primary landmarks (like the Eiffel Tower or Senso-ji Temple) and purchase public transit passes.

@@ -1,4 +1,6 @@
 import { Injectable, NotFoundException, Logger, Inject } from '@nestjs/common';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import type { Cache } from 'cache-manager';
 
 export interface TripData {
   id: string;
@@ -19,7 +21,10 @@ export interface TripData {
 export class TripsService {
   private readonly logger = new Logger(TripsService.name);
 
-  constructor(@Inject('DATABASE_POOL') private readonly pool: any) {
+  constructor(
+    @Inject('DATABASE_POOL') private readonly pool: any,
+    @Inject(CACHE_MANAGER) private readonly cacheManager: Cache
+  ) {
     this.ensureDbExists();
   }
 
@@ -83,6 +88,12 @@ export class TripsService {
           newTrip.createdAt,
         ],
       );
+      
+      // Seed cache immediately
+      this.cacheManager.set(`trip:${tripId}`, newTrip).catch(err => {
+        this.logger.warn(`Failed to seed cache for new trip ${tripId}: ${err.message}`);
+      });
+      
       return newTrip;
     } catch (err: any) {
       this.logger.error(`Failed to insert trip ${tripId} in database: ${err.message}`);
@@ -92,12 +103,18 @@ export class TripsService {
 
   async getTrip(id: string): Promise<TripData> {
     try {
-      const res = await this.pool.query('SELECT * FROM trips WHERE id = $1', [id]);
+      const dbPromise = this.pool.query('SELECT * FROM trips WHERE id = $1', [id]);
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Database query timed out')), 2500)
+      );
+
+      const res = await Promise.race([dbPromise, timeoutPromise]) as any;
+
       if (res.rows.length === 0) {
         throw new NotFoundException(`Trip plan with ID ${id} not found`);
       }
       const row = res.rows[0];
-      return {
+      const tripData = {
         id: row.id,
         origin: row.origin,
         destination: row.destination,
@@ -111,9 +128,23 @@ export class TripsService {
         combinedPlan: row.combined_plan || undefined,
         seasonGuide: row.season_guide || undefined,
       };
+
+      // Update cache asynchronously
+      this.cacheManager.set(`trip:${id}`, tripData).catch(err => {
+        this.logger.warn(`Failed to update cache for trip ${id}: ${err.message}`);
+      });
+
+      return tripData;
     } catch (err: any) {
       if (err instanceof NotFoundException) throw err;
-      this.logger.error(`Failed to fetch trip ${id} from database: ${err.message}`);
+
+      this.logger.error(`[DB_FALLBACK] Primary DB read failed for trip ${id}: ${err.message}. Routing to Redis cache...`);
+      const cachedTrip = await this.cacheManager.get<TripData>(`trip:${id}`);
+      if (cachedTrip) {
+        return cachedTrip;
+      }
+
+      this.logger.error(`[DB_FALLBACK] Cache miss for trip ${id}. Data unavailable.`);
       throw err;
     }
   }
@@ -142,6 +173,12 @@ export class TripsService {
           id,
         ],
       );
+      
+      // Update cache immediately to maintain consistency
+      this.cacheManager.set(`trip:${id}`, merged).catch(err => {
+        this.logger.warn(`Failed to update cache for trip ${id}: ${err.message}`);
+      });
+      
       return merged;
     } catch (err: any) {
       this.logger.error(`Failed to update trip ${id} in database: ${err.message}`);

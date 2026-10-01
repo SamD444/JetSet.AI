@@ -24,6 +24,7 @@ interface CopilotState {
   draftSelections: any;
   hasInteracted: boolean;
   tripId: string;
+  documentContext: string | null;
   setIsOpen: (isOpen: boolean) => void;
   addMessage: (msg: CopilotMessage) => void;
   setActiveRoute: (route: string) => void;
@@ -34,6 +35,7 @@ interface CopilotState {
   setJettyState: (state: JettyState) => void;
   setIsStreaming: (val: boolean) => void;
   setTripId: (tripId: string) => void;
+  setDocumentContext: (context: string | null) => void;
 }
 
 export const useCopilotStore = create<CopilotState>((set) => ({
@@ -46,6 +48,7 @@ export const useCopilotStore = create<CopilotState>((set) => ({
   draftSelections: null,
   hasInteracted: false,
   tripId: '',
+  documentContext: null,
   setIsOpen: (isOpen) => set({ isOpen, hasInteracted: true }),
   addMessage: (msg) => set((state) => ({ messages: [...state.messages, msg], hasInteracted: true })),
   setActiveRoute: (route) => set({ activeRoute: route }),
@@ -56,4 +59,5 @@ export const useCopilotStore = create<CopilotState>((set) => ({
   setJettyState: (jettyState) => set({ jettyState }),
   setIsStreaming: (isStreaming) => set({ isStreaming }),
   setTripId: (tripId) => set({ tripId }),
+  setDocumentContext: (documentContext) => set({ documentContext }),
 }));

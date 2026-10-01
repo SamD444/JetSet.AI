@@ -12,9 +12,10 @@ import { Form } from "@/components/ui/form";
 import Step1Destination from "./Step1Destination";
 import Step2Dates from "./Step2Dates";
 import Step3Preferences from "./Step3Preferences";
-import { Loader2 } from "lucide-react";
+import { Loader2, UploadCloud } from "lucide-react";
 import { getApiUrl } from "@/utils/api";
 import { formatLocalDateToYMD, formatDisplayDates } from "@/lib/dateUtils";
+import { useCopilotStore } from "@/store/copilotStore";
 
 // Define the form schema
 export const tripFormSchema = z.object({
@@ -43,6 +44,9 @@ const generatePlaceholderId = () => `trip-${Date.now()}-${Math.random().toString
 export default function TripWizard() {
     const [step, setStep] = useState(1);
     const [isSubmitting, setIsSubmitting] = useState(false);
+    const [isUploading, setIsUploading] = useState(false);
+    const [uploadError, setUploadError] = useState<string | null>(null);
+    const { setDocumentContext, setIsOpen, addMessage } = useCopilotStore();
     const totalSteps = 3;
     const cardRef = useRef<HTMLDivElement>(null);
 
@@ -78,6 +82,56 @@ export default function TripWizard() {
     });
 
     const router = useRouter();
+
+    const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+
+        setIsUploading(true);
+        setUploadError(null);
+        const formData = new FormData();
+        formData.append("file", file);
+
+        try {
+            const baseUrl = getApiUrl();
+            const res = await fetch(`${baseUrl}/ai/upload`, {
+                method: "POST",
+                body: formData,
+            });
+
+            if (!res.ok) throw new Error("Upload request failed");
+
+            const data = await res.json();
+            
+            if (data.isValidTravelDocument === false) {
+                setUploadError(data.error || "This document does not appear to be travel-related.");
+                return;
+            }
+
+            if (data.origin) form.setValue("origin", data.origin, { shouldValidate: true });
+            if (data.destination) form.setValue("destination", data.destination, { shouldValidate: true });
+            if (data.fromDate && data.toDate) {
+                form.setValue("dateRange", {
+                    from: new Date(data.fromDate + "T12:00:00"),
+                    to: new Date(data.toDate + "T12:00:00"),
+                }, { shouldValidate: true });
+            }
+            if (data.documentContext) {
+                setDocumentContext(data.documentContext);
+            }
+            
+            if (data.proactiveMessage) {
+                addMessage({ role: 'model', content: data.proactiveMessage });
+                setIsOpen(true);
+            }
+        } catch (error) {
+            console.error("Upload error:", error);
+            setUploadError("Failed to analyze travel document due to a network error.");
+        } finally {
+            setIsUploading(false);
+        }
+    };
+
     const onSubmit = async (data: TripFormValues) => {
         setIsSubmitting(true);
         try {
@@ -222,6 +276,26 @@ export default function TripWizard() {
                     Step {step} of {totalSteps}
                 </p>
             </div>
+
+            {step === 1 && (
+                <div className="mb-6 w-full max-w-md mx-auto">
+                    <label className={`flex flex-col items-center justify-center w-full min-h-24 border-2 border-dashed ${uploadError ? 'border-red-500/50 bg-red-500/10' : 'border-sky-vivid/30 bg-white/5 hover:bg-white/10'} rounded-xl cursor-pointer transition-all group p-4`}>
+                        <div className="flex flex-col items-center justify-center">
+                            {isUploading ? (
+                                <Loader2 className="w-6 h-6 text-sky-400 animate-spin mb-2" />
+                            ) : uploadError ? (
+                                <UploadCloud className="w-6 h-6 text-red-400 mb-2" />
+                            ) : (
+                                <UploadCloud className="w-6 h-6 text-sky-400 mb-2 group-hover:scale-110 transition-transform" />
+                            )}
+                            <p className={`text-xs text-center px-4 ${uploadError ? 'text-red-400/90' : 'text-white/70'}`}>
+                                {isUploading ? "Analyzing document..." : uploadError ? uploadError : "Upload travel docs (PDF/Image) to auto-fill"}
+                            </p>
+                        </div>
+                        <input type="file" className="hidden" accept=".pdf,image/*" onChange={handleFileUpload} disabled={isUploading} />
+                    </label>
+                </div>
+            )}
 
             <Form {...form}>
                 <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
