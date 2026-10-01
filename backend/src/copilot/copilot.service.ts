@@ -148,7 +148,7 @@ ${ragContextString}
     }
 
     try {
-      this.logger.log(`Executing itinerary edit for trip ${tripId}: "${instruction}"`);
+      this.logger.log(`[Tuffy Groq] Executing itinerary edit for trip ${tripId}: "${instruction}"`);
       const trip = await this.tripsService.getTrip(tripId);
       if (!trip) {
         return { success: false, confirmation: 'Trip not found in database.' };
@@ -222,7 +222,7 @@ Day 2: [Day Title]
       const updatedItinerary = updatedRaw.replace(/```[a-z]*\n?/gi, '').replace(/```/g, '').trim();
 
       if (!updatedItinerary.includes('Day 1')) {
-        this.logger.warn('AI returned invalid itinerary format. Keeping previous itinerary.');
+        this.logger.warn('[Internal Groq] AI returned invalid itinerary format. Keeping previous itinerary.');
         return { success: false, confirmation: 'Could not apply itinerary modification cleanly.' };
       }
 
@@ -238,7 +238,7 @@ Day 2: [Day Title]
       }
 
       await this.tripsService.updateTrip(tripId, { combinedPlan: newCombinedPlan });
-      this.logger.log(`Successfully updated and persisted itinerary for trip ${tripId}`);
+      this.logger.log(`[Deterministic] Successfully updated and persisted itinerary for trip ${tripId}`);
 
       // Generate a natural, concise confirmation
       let confirmation = `Done — I've updated your itinerary with: "${instruction}".`;
@@ -259,7 +259,7 @@ Day 2: [Day Title]
 
       return { success: true, updatedItinerary, confirmation };
     } catch (err: any) {
-      this.logger.error(`executeItineraryEdit failed: ${err.message}`);
+      this.logger.error(`[Internal Groq] executeItineraryEdit failed: ${err.message}`);
       return { success: false, confirmation: `Failed to modify itinerary: ${err.message}` };
     }
   }
@@ -277,6 +277,7 @@ Day 2: [Day Title]
     }
 
     try {
+      this.logger.log(`[Tuffy Groq] Executing canonical trip modification for trip ${tripId}: ${JSON.stringify(updates)}`);
       const result = await this.tripsService.modifyTrip(tripId, updates, this.aiService);
       return {
         success: true,
@@ -285,7 +286,7 @@ Day 2: [Day Title]
         updatedFields: result.updatedFields,
       };
     } catch (err: any) {
-      this.logger.error(`executeTripModify failed: ${err.message}`);
+      this.logger.error(`[Tuffy Groq] executeTripModify failed: ${err.message}`);
       return { success: false, confirmation: `Failed to update trip: ${err.message}`, updatedFields: [] };
     }
   }

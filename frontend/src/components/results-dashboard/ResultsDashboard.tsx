@@ -196,14 +196,6 @@ export default function ResultsDashboard({ tripId, org, dest, dates, displayDate
     }, [tripId, tripState.destination]);
 
     useEffect(() => {
-        // Pre-fetch all other tabs in the background 100ms after initial mount
-        const timer = setTimeout(() => {
-            setVisitedTabs(["summary", "flights", "hotels", "season", "itinerary"]);
-        }, 100);
-        return () => clearTimeout(timer);
-    }, []);
-
-    useEffect(() => {
         const handleSwitchTab = (e: Event) => {
             const customEvent = e as CustomEvent;
             const targetTab = customEvent.detail;
@@ -218,7 +210,7 @@ export default function ResultsDashboard({ tripId, org, dest, dates, displayDate
         return () => window.removeEventListener("switch-tab", handleSwitchTab);
     }, [visitedTabs]);
 
-    // Synchronize with Copilot mutations
+    // Synchronize with Copilot mutations (single canonical event)
     useEffect(() => {
         const handleTripUpdated = (e: Event) => {
             const detail = (e as CustomEvent).detail || {};
@@ -226,10 +218,8 @@ export default function ResultsDashboard({ tripId, org, dest, dates, displayDate
         };
 
         window.addEventListener("copilot-trip-updated", handleTripUpdated);
-        window.addEventListener("copilot-modify-trip", handleTripUpdated);
         return () => {
             window.removeEventListener("copilot-trip-updated", handleTripUpdated);
-            window.removeEventListener("copilot-modify-trip", handleTripUpdated);
         };
     }, [applyCanonicalTripUpdate]);
 

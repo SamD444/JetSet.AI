@@ -30,7 +30,8 @@ For the backend to execute properly, configure the following under your Hugging 
 | Secret Key | Description |
 | :--- | :--- |
 | `DATABASE_URL` | Supabase PostgreSQL connection string with pgvector |
-| `GROQ_API_KEY` | Groq API Key (Primary LLM & Tuffy Copilot stream) |
+| `GROQ_API_KEY` | JetSet Internal Groq API Key (Primary LLM generation) |
+| `TUFFY_GROQ_API_KEY` | Tuffy Dedicated Groq API Key (Tuffy Copilot agent stream) |
 | `OPENROUTER_API_KEY` | OpenRouter API Key (RAG Embeddings & Fallback LLM) |
 | `SERPAPI_KEY_FLIGHTS` | SerpAPI Key for live Google Flights pricing |
 | `SERPAPI_KEY_HOTELS` | SerpAPI Key for live Google Hotels data |

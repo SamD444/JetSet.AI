@@ -57,22 +57,57 @@ export class HotelsService {
 
     // Static fallback list if cache doesn't match or fails
     const staticMap: Record<string, string> = {
-      'PARIS': 'CDG',
-      'PAR': 'CDG',
+      'THAILAND': 'BKK',
+      'BANGKOK': 'BKK',
+      'PHUKET': 'HKT',
+      'CHIANG MAI': 'CNX',
+      'PATTAYA': 'BKK',
+      'KRABI': 'KBV',
+      'KOH SAMUI': 'USM',
+      'SAMUI': 'USM',
+      'VIETNAM': 'HAN',
+      'HANOI': 'HAN',
+      'HO CHI MINH': 'SGN',
+      'DA NANG': 'DAD',
+      'BALI': 'DPS',
+      'INDONESIA': 'DPS',
+      'JAKARTA': 'CGK',
+      'MALDIVES': 'MLE',
+      'MALE': 'MLE',
+      'SRI LANKA': 'CMB',
+      'COLOMBO': 'CMB',
+      'NEPAL': 'KTM',
+      'KATHMANDU': 'KTM',
+      'SINGAPORE': 'SIN',
+      'MALAYSIA': 'KUL',
+      'KUALA LUMPUR': 'KUL',
+      'JAPAN': 'HND',
       'TOKYO': 'HND',
       'TYO': 'HND',
+      'KYOTO': 'KIX',
+      'OSAKA': 'KIX',
+      'PARIS': 'CDG',
+      'PAR': 'CDG',
       'NEW YORK': 'JFK',
       'NYC': 'JFK',
       'DELHI': 'DEL',
       'DEL': 'DEL',
       'BHUBANESWAR': 'BBI',
       'BBI': 'BBI',
+      'KOLKATA': 'CCU',
+      'MUMBAI': 'BOM',
       'LONDON': 'LHR',
       'LON': 'LHR',
+      'DUBAI': 'DXB',
+      'ROME': 'FCO',
+      'BARCELONA': 'BCN',
+      'FRANKFURT': 'FRA',
+      'ZURICH': 'ZRH',
+      'SYDNEY': 'SYD',
     };
     
     for (const [key, value] of Object.entries(staticMap)) {
-      if (cleanKeyword.includes(key) || key.includes(cleanKeyword)) {
+      if (cleanKeyword === key || cleanKeyword.includes(key) || key.includes(cleanKeyword)) {
         return value;
       }
     }
@@ -479,34 +514,14 @@ export class HotelsService {
   }
 
   private async processHotelsWithScoringAndGrok(hotels: any[], tripData: any): Promise<any[]> {
-    let enrichedHotels = this.calculateBackendHotelScores(hotels, tripData);
+    const enrichedHotels = this.calculateBackendHotelScores(hotels, tripData);
     
     // Sort by Match Score (descending)
     enrichedHotels.sort((a, b) => (b.matchScore || 0) - (a.matchScore || 0));
 
-    if (tripData) {
-      try {
-        const topHotels = enrichedHotels.slice(0, 3);
-        const explanations = await this.aiService.explainHotelsWithGrok(topHotels, tripData);
-        
-        enrichedHotels = enrichedHotels.map(h => {
-          const exp = explanations[h.hotelId];
-          if (exp) {
-            return {
-              ...h,
-              matchScore: exp.score,
-              matchReason: exp.reason
-            };
-          }
-          return h;
-        });
-
-        // Re-sort to apply updated Grok scores
-        enrichedHotels.sort((a, b) => (b.matchScore || 0) - (a.matchScore || 0));
-      } catch (e: any) {
-        this.logger.error(`Error during Grok hotel explanation: ${e.message}`);
-      }
-    }
+    // calculateBackendHotelScores provides comprehensive 5-factor scoring (budget fit, companion suitability,
+    // interests match, location convenience, review quality) and personalized match reasons deterministically.
+    this.logger.log(`[Deterministic] Enriched and ranked ${enrichedHotels.length} hotels with 5-factor scoring and personalized match reasons`);
     return enrichedHotels;
   }
 

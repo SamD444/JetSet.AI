@@ -34,8 +34,7 @@ export class TripsController {
     const trip = await this.tripsService.getTrip(id);
 
     if (!trip.combinedPlan) {
-      const fallback = this.aiService.buildFallbackStop(trip.destination, trip.fromDate, trip.toDate);
-      return { status: 'ready', stops: fallback };
+      return { status: 'pending' };
     }
 
     const stops = await this.aiService.extractItineraryStops(
@@ -62,10 +61,7 @@ export class TripsController {
     const trip = await this.tripsService.getTrip(id);
 
     if (!trip.combinedPlan) {
-      // Even if AI combined plan is still streaming/generating, immediately provide deterministic flight legs
-      // based on trip origin/destination/dates so the user can view commercial flights right away.
-      const fallback = this.aiService.fallbackFlightLegs(trip);
-      return { status: 'ready', legs: fallback };
+      return { status: 'pending' };
     }
 
     let legs = await this.aiService.extractFlightLegs({

@@ -95,7 +95,8 @@ Create a `.env` file in the `backend/` directory:
 ```env
 PORT=3001
 GEMINI_API_KEY=your_gemini_key
-GROK_API_KEY=your_grok_key
+GROQ_API_KEY=your_jetset_internal_groq_key
+TUFFY_GROQ_API_KEY=your_tuffy_dedicated_groq_key
 SERPAPI_API_KEY=your_serpapi_key
 DATABASE_URL=postgresql://postgres:...supabase.co:5432/postgres
 ```

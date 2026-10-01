@@ -8,8 +8,12 @@ export class LlmService {
   private readonly logger = new Logger(LlmService.name);
 
   constructor(private configService: ConfigService) {
+    const key = this.configService.get<string>('TUFFY_GROQ_API_KEY');
+    if (key && key.trim()) {
+      this.logger.log('[Tuffy Groq] Groq client initialized for Tuffy Agent (model: openai/gpt-oss-120b)');
+    }
     this.groq = new Groq({
-      apiKey: this.configService.get<string>('GROQ_API_KEY'),
+      apiKey: key,
     });
   }
 
@@ -19,7 +23,7 @@ export class LlmService {
     abortSignal?: AbortSignal,
   ): Promise<any> {
     try {
-      this.logger.log('Starting Groq chat completion stream');
+      this.logger.log('[Tuffy Groq] Starting chat completion stream');
       const stream = await this.groq.chat.completions.create(
         {
           messages: [
@@ -160,7 +164,7 @@ export class LlmService {
       );
       return stream;
     } catch (error) {
-      this.logger.error('Error in Groq stream', error);
+      this.logger.error('[Tuffy Groq] Error in Groq stream', error);
       throw error;
     }
   }

@@ -151,8 +151,6 @@ export function CopilotSheet() {
                  }
                } else if (tool.function.name === 'modify_trip') {
                  const args = JSON.parse(tool.function.arguments);
-                 // Dispatch a custom event so the results page can update URL params / trip state
-                 window.dispatchEvent(new CustomEvent('copilot-modify-trip', { detail: args }));
                  // Switch to the most relevant tab after modification
                  if (args.fromDate || args.toDate) {
                    setTimeout(() => window.dispatchEvent(new CustomEvent('switch-tab', { detail: 'flights' })), 800);

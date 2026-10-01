@@ -111,15 +111,15 @@ export class AiService {
     if (this.openRouterService.hasKey) {
       this.logger.log(`OpenRouter API initialized for AiService (Model: ${this.openRouterService.getModel()})`);
     }
-    const grokKey = this.configService.get<string>('GROK_API_KEY');
+    const grokKey = this.configService.get<string>('GROQ_API_KEY');
     if (grokKey && grokKey.trim() !== '') {
       this.hasGrokKey = true;
-      this.logger.log('Grok API initialized for AiService');
+      this.logger.log('Groq API initialized for AiService');
     }
   }
 
   private getGrokConfig(): { url: string; model: string; headers: Record<string, string> } {
-    const key = this.configService.get<string>('GROK_API_KEY') || '';
+    const key = this.configService.get<string>('GROQ_API_KEY') || '';
     if (key.startsWith('gsk_')) {
       return {
         url: 'https://api.groq.com/openai/v1/chat/completions',
@@ -149,12 +149,38 @@ export class AiService {
   private readonly OPENROUTER_FALLBACK_TIMEOUT_MS = 60_000; // 60 s – free models can be slow
   private readonly GROK_STREAM_READ_TIMEOUT_MS = 45_000;   // 45 s – max time for a Groq SSE stream
 
+  // ─── OpenRouter Fallback Concurrency Limiter (Max 2 simultaneous fallback requests) ───
+  private activeOpenRouterFallbackRequests = 0;
+  private readonly MAX_OPENROUTER_FALLBACK_CONCURRENCY = 2;
+  private readonly openRouterQueue: Array<() => void> = [];
+
+  private async acquireOpenRouterFallbackSlot(): Promise<void> {
+    if (this.activeOpenRouterFallbackRequests < this.MAX_OPENROUTER_FALLBACK_CONCURRENCY) {
+      this.activeOpenRouterFallbackRequests++;
+      return;
+    }
+    return new Promise<void>((resolve) => {
+      this.openRouterQueue.push(() => {
+        this.activeOpenRouterFallbackRequests++;
+        resolve();
+      });
+    });
+  }
+
+  private releaseOpenRouterFallbackSlot(): void {
+    this.activeOpenRouterFallbackRequests = Math.max(0, this.activeOpenRouterFallbackRequests - 1);
+    const next = this.openRouterQueue.shift();
+    if (next) {
+      next();
+    }
+  }
+
   /** Returns true when Grok should be skipped due to recent failures. */
   private isGrokCircuitOpen(): boolean {
     if (!this.grokCircuitOpen) return false;
     if (Date.now() - this.grokCircuitOpenAt > this.GROK_COOLDOWN_MS) {
       this.grokCircuitOpen = false;
-      this.logger.log('Grok circuit breaker reset — retrying Grok.');
+      this.logger.log('[Internal Groq] Circuit breaker reset — retrying Groq.');
       return false;
     }
     return true;
@@ -163,7 +189,7 @@ export class AiService {
   private tripGrokCircuit(reason: string) {
     this.grokCircuitOpen = true;
     this.grokCircuitOpenAt = Date.now();
-    this.logger.warn(`Grok circuit opened for ${this.GROK_COOLDOWN_MS / 1000}s: ${reason}`);
+    this.logger.warn(`[Internal Groq] Circuit opened for ${this.GROK_COOLDOWN_MS / 1000}s: ${reason}`);
   }
 
   /** Wraps a fetch promise with a hard timeout. Rejects with a timeout error if exceeded. */
@@ -182,7 +208,7 @@ export class AiService {
     systemPrompt = 'You are a helpful travel planning assistant.',
     expectJson = false,
   ): Promise<string> {
-    const grokKey = this.configService.get<string>('GROK_API_KEY');
+    const grokKey = this.configService.get<string>('GROQ_API_KEY');
     const hasGrok = !!(grokKey && grokKey.trim());
     const hasOpenRouter = this.openRouterService.hasKey;
 
@@ -191,9 +217,7 @@ export class AiService {
     }
 
     // Sequential path: always try Groq first. Only use OpenRouter if Groq fails or circuit is open.
-    // IMPORTANT: We must NOT race providers — OpenRouter is a rate-limited fallback (50 req/day free tier).
-
-    // Slow path: try Groq then OpenRouter
+    // IMPORTANT: We must NOT race providers — OpenRouter is a rate-limited fallback.
     if (hasGrok && !this.isGrokCircuitOpen()) {
       try {
         const config = this.getGrokConfig();
@@ -206,11 +230,11 @@ export class AiService {
         };
         if (expectJson) body.response_format = { type: 'json_object' };
 
-        this.logger.log(`callModelWithFallback: trying Groq (${config.model})...`);
+        this.logger.log(`[Internal Groq] callModelWithFallback (${config.model})...`);
         const res = await this.withTimeout(
           fetch(config.url, { method: 'POST', headers: config.headers, body: JSON.stringify(body) }),
           this.AI_REQUEST_TIMEOUT_MS,
-          'Grok'
+          'Internal Groq'
         );
         if (res.ok) {
           const data = await res.json();
@@ -222,13 +246,14 @@ export class AiService {
         }
       } catch (e: any) {
         this.tripGrokCircuit(e.message);
-        this.logger.warn(`Grok failed: ${e.message} — switching to OpenRouter...`);
+        this.logger.warn(`[Internal Groq] Failed: ${e.message} — switching to OpenRouter fallback...`);
       }
     }
 
     if (hasOpenRouter) {
+      await this.acquireOpenRouterFallbackSlot();
       try {
-        this.logger.log(`callModelWithFallback: using OpenRouter fallback (${this.openRouterService.getModel()})...`);
+        this.logger.log(`[OpenRouter Fallback] callModelWithFallback using (${this.openRouterService.getModel()})...`);
         // Free-tier OpenRouter models can take 30-60s to respond — use a generous timeout.
         const content = await this.withTimeout(
           this.openRouterService.chatCompletion({
@@ -243,11 +268,52 @@ export class AiService {
         );
         if (content?.trim()) return content;
       } catch (e: any) {
-        this.logger.error(`OpenRouter fallback failed: ${e.message}`);
+        this.logger.error(`[OpenRouter Fallback] Failed: ${e.message}`);
+      } finally {
+        this.releaseOpenRouterFallbackSlot();
       }
     }
 
     throw new Error('All AI generation attempts failed (Groq and OpenRouter)');
+  }
+
+  async generateCombinedPlan(
+    tripId: string,
+    trip: any,
+    onChunk?: (text: string) => void,
+  ): Promise<string> {
+    const genKey = `combined_plan_${tripId}`;
+    const activeGen = this.activeGenerations.get(genKey);
+    if (activeGen) {
+      this.logger.log(`[Deterministic] Reusing active in-flight combinedPlan generation for trip ${tripId}`);
+      return activeGen;
+    }
+
+    const ragContext = await this.ragService.retrieveContext(trip.destination, 3);
+    const contextString = ragContext.length > 0
+      ? ragContext.join('\n\n')
+      : 'No travel document context found in library. Use general knowledge.';
+
+    const promise = (async () => {
+      this.logger.log(`[Internal Groq] Generating combinedPlan for trip ${tripId} (${trip.destination})...`);
+      const fullResponse = await this.callCombinedPlanGenerationStream(trip, contextString, (chunk) => {
+        if (onChunk) onChunk(chunk);
+      });
+      try {
+        await this.tripsService.updateTrip(tripId, { combinedPlan: fullResponse });
+        this.logger.log(`[Deterministic] Cached combinedPlan for trip ${tripId}`);
+      } catch (cacheErr: any) {
+        this.logger.warn(`Could not cache combined plan for trip ${tripId}: ${cacheErr.message}`);
+      }
+      return fullResponse;
+    })();
+
+    this.activeGenerations.set(genKey, promise);
+    try {
+      return await promise;
+    } finally {
+      this.activeGenerations.delete(genKey);
+    }
   }
 
   async getSummaryStream(tripId: string, onChunk: (text: string) => void, onComplete: () => void) {
@@ -272,6 +338,7 @@ export class AiService {
       const summaryText = this.extractSection(trip.combinedPlan, 'summary');
       const hasPerDayOnly = summaryText.includes('Total Per Day') || (!summaryText.includes('Flights') && !summaryText.includes('International Flights') && !summaryText.includes('Domestic Transport'));
       if (summaryText && summaryText.trim() && !hasPerDayOnly) {
+        this.logger.log(`[Deterministic] Reusing cached summary section for trip ${tripId}`);
         await this.streamString(summaryText, onChunk);
         onComplete();
         return;
@@ -286,35 +353,41 @@ export class AiService {
       }
     }
 
-    const ragContext = await this.ragService.retrieveContext(trip.destination, 3);
-    const contextString = ragContext.length > 0
-      ? ragContext.join('\n\n')
-      : 'No travel document context found in library. Use general knowledge.';
+    // Check if in-flight generation already running
+    const genKey = `combined_plan_${tripId}`;
+    const activeGen = this.activeGenerations.get(genKey);
+    if (activeGen) {
+      this.logger.log(`[Deterministic] Reusing in-flight combined plan for summary of trip ${tripId}`);
+      try {
+        const fullResponse = await activeGen;
+        const summaryText = this.extractSection(fullResponse, 'summary');
+        if (summaryText) {
+          await this.streamString(summaryText, onChunk);
+        }
+      } catch (err: any) {
+        this.logger.error(`Awaited summary generation failed: ${err.message}`);
+      }
+      onComplete();
+      return;
+    }
 
     let planSucceeded = false;
     try {
       const streamer = new SectionStreamer('---SUMMARY_START---', '---SUMMARY_END---', onChunk);
-      const fullResponse = await this.callCombinedPlanGenerationStream(trip, contextString, (chunk) => {
-        streamer.push(chunk);
-      });
+      await this.generateCombinedPlan(tripId, trip, (chunk) => streamer.push(chunk));
       streamer.flush();
       planSucceeded = true;
-
-      // Try to cache — but don't let cache failure break the response
-      try {
-        await this.tripsService.updateTrip(tripId, { combinedPlan: fullResponse });
-      } catch (cacheErr: any) {
-        this.logger.warn(`Could not cache combined plan for trip ${tripId}: ${cacheErr.message}`);
-      }
       onComplete();
     } catch (error: any) {
       this.logger.error(`Failed to stream summary combined plan: ${error.message}`);
       if (!planSucceeded) {
+        const ragContext = await this.ragService.retrieveContext(trip.destination, 3);
+        const contextString = ragContext.length > 0 ? ragContext.join('\n\n') : '';
         const openrouterKey = this.configService.get<string>('OPENROUTER_API_KEY');
-        const grokKey = this.configService.get<string>('GROK_API_KEY');
+        const grokKey = this.configService.get<string>('GROQ_API_KEY');
         let reason = 'The AI model quota limits have been temporarily exceeded or the API services returned a rate limit error (429).';
         if (!openrouterKey && !grokKey) {
-          reason = 'Both OPENROUTER_API_KEY and GROK_API_KEY are missing from the backend configuration.';
+          reason = 'Both OPENROUTER_API_KEY and GROQ_API_KEY are missing from the backend configuration.';
         }
         const apology = `
 > ### 🌍 A Gentle Apology from JetSet.AI
@@ -322,7 +395,7 @@ export class AiService {
 > We are sincerely sorry, but our intelligent planning assistant is currently unable to generate a fresh custom plan.
 > **Reason:** ${reason}
 > 
-> * **For Developers:** Please check and verify that your \`OPENROUTER_API_KEY\` and/or \`GROK_API_KEY\` in your backend \`.env\` file are set, active, and have sufficient billing credits to execute requests.
+> * **For Developers:** Please check and verify that your \`OPENROUTER_API_KEY\` and/or \`GROQ_API_KEY\` in your backend \`.env\` file are set, active, and have sufficient billing credits to execute requests.
 > * **For Travelers:** While we wait for the AI endpoints to reset, here is a localized backup itinerary we prepared for you to get started:
 > 
 `;
@@ -378,7 +451,7 @@ Example:
         // Clear cached plan/seasonGuide since structural params changed
         updates.combinedPlan = null;
         updates.seasonGuide = null;
-        this.logger.log(`Detected trip updates: ${JSON.stringify(updates)}`);
+        this.logger.log(`[Deterministic] Detected trip updates from chat: ${JSON.stringify(updates)}`);
         await this.tripsService.updateTrip(tripId, updates);
         return updates;
       }
@@ -404,35 +477,42 @@ Example:
 
     const latestUserMessage = messages[messages.length - 1]?.content || '';
 
-    // 1. Detect structural trip modifications (e.g. changing companion, dates, budget, destination)
+    // Check if this is an internal frontend module prompt (itinerary/season/summary)
+    const isItineraryRequest = latestUserMessage.includes('day-by-day travel itinerary') || latestUserMessage.includes('travel itinerary');
+    const isSeasonRequest = latestUserMessage.includes('Best Time to Visit') || latestUserMessage.includes('When to Go');
+    const isInternalModulePrompt = isItineraryRequest || isSeasonRequest;
+
+    // 1. Detect structural trip modifications ONLY for actual interactive user messages (bypassing static module prompts)
     let detectedUpdates: any = null;
-    try {
-      detectedUpdates = await this.detectAndApplyTripUpdates(tripId, trip, latestUserMessage);
-      if (detectedUpdates) {
-        // Merge updates locally so prompts are constructed with the latest structural details
-        trip = { ...trip, ...detectedUpdates };
+    if (!isInternalModulePrompt && latestUserMessage.trim().length > 0) {
+      try {
+        detectedUpdates = await this.detectAndApplyTripUpdates(tripId, trip, latestUserMessage);
+        if (detectedUpdates) {
+          // Merge updates locally so prompts are constructed with the latest structural details
+          trip = { ...trip, ...detectedUpdates };
+        }
+      } catch (e: any) {
+        this.logger.warn(`Could not run trip updates detector: ${e.message}`);
       }
-    } catch (e: any) {
-      this.logger.warn(`Could not run trip updates detector: ${e.message}`);
     }
 
     // Check if it's the Itinerary Module Request
-    const isItineraryRequest = latestUserMessage.includes('day-by-day travel itinerary') || latestUserMessage.includes('travel itinerary');
     if (isItineraryRequest) {
       if (trip.combinedPlan) {
         const itineraryText = this.extractSection(trip.combinedPlan, 'itinerary');
         if (itineraryText) {
+          this.logger.log(`[Deterministic] Reusing cached itinerary section for trip ${tripId}`);
           await this.streamString(itineraryText, onChunk);
           onComplete();
           return;
         }
       }
 
-      // Deduplicate active parallel itinerary generations
-      const genKey = `itinerary_${tripId}`;
+      // Deduplicate active parallel itinerary / combined plan generations
+      const genKey = `combined_plan_${tripId}`;
       const activeGen = this.activeGenerations.get(genKey);
       if (activeGen) {
-        this.logger.log(`Reusing active in-flight itinerary generation for trip ${tripId}`);
+        this.logger.log(`[Deterministic] Reusing active in-flight combinedPlan generation for itinerary of trip ${tripId}`);
         try {
           const res = await activeGen;
           const itineraryText = this.extractSection(res, 'itinerary');
@@ -446,40 +526,23 @@ Example:
         return;
       }
 
-      // Generate and cache combined plan, streaming the itinerary
-      const ragContext = await this.ragService.retrieveContext(trip.destination, 3);
-      const contextString = ragContext.length > 0 ? ragContext.join('\n\n') : 'No travel guide context. Use general knowledge.';
-      
-      const promise = (async () => {
-        const streamer = new SectionStreamer('---ITINERARY_START---', '---ITINERARY_END---', onChunk);
-        const fullResponse = await this.callCombinedPlanGenerationStream(trip, contextString, (chunk) => {
-          streamer.push(chunk);
-        });
-        streamer.flush();
-        try {
-          await this.tripsService.updateTrip(tripId, { combinedPlan: fullResponse });
-        } catch (cacheErr: any) {
-          this.logger.warn(`Could not cache itinerary plan for trip ${tripId}: ${cacheErr.message}`);
-        }
-        return fullResponse;
-      })();
-
-      this.activeGenerations.set(genKey, promise);
+      // Generate and cache combined plan, streaming the itinerary section
       try {
-        await promise;
+        const streamer = new SectionStreamer('---ITINERARY_START---', '---ITINERARY_END---', onChunk);
+        await this.generateCombinedPlan(tripId, trip, (chunk) => streamer.push(chunk));
+        streamer.flush();
       } catch (err: any) {
         this.logger.error(`Combined plan itinerary generation failed: ${err.message}`);
       } finally {
-        this.activeGenerations.delete(genKey);
         onComplete();
       }
       return;
     }
 
     // Check if it's the When to Go Module Request
-    const isSeasonRequest = latestUserMessage.includes('Best Time to Visit');
     if (isSeasonRequest) {
       if (trip.seasonGuide && trip.seasonGuide.length > 50 && !trip.seasonGuide.includes('|')) {
+        this.logger.log(`[Deterministic] Reusing cached season guide for trip ${tripId}`);
         await this.streamString(trip.seasonGuide, onChunk);
         onComplete();
         return;
@@ -489,7 +552,7 @@ Example:
       const genKey = `season_${trip.destination}`;
       const activeGen = this.activeGenerations.get(genKey);
       if (activeGen) {
-        this.logger.log(`Reusing active in-flight season guide generation for destination ${trip.destination}`);
+        this.logger.log(`[Deterministic] Reusing active in-flight season guide generation for destination ${trip.destination}`);
         try {
           const res = await activeGen;
           await this.streamString(res, onChunk);
@@ -501,6 +564,7 @@ Example:
       }
 
       const promise = (async () => {
+        this.logger.log(`[Internal Groq] Generating season guide for ${trip.destination}...`);
         const fullResponse = await this.callSeasonGuideGenerationStream(trip.destination, onChunk);
         try {
           await this.tripsService.updateTrip(tripId, { seasonGuide: fullResponse });
@@ -1026,10 +1090,10 @@ Do not write a massive month-by-month table or huge essays. Keep the entire resp
     }
     if (!success) {
       const openrouterKey = this.configService.get<string>('OPENROUTER_API_KEY');
-      const grokKey = this.configService.get<string>('GROK_API_KEY');
+      const grokKey = this.configService.get<string>('GROQ_API_KEY');
       let reason = 'The AI model quota limits have been temporarily exceeded or the API services returned a rate limit error (429).';
       if (!openrouterKey && !grokKey) {
-        reason = 'Both OPENROUTER_API_KEY and GROK_API_KEY are missing from the backend configuration.';
+        reason = 'Both OPENROUTER_API_KEY and GROQ_API_KEY are missing from the backend configuration.';
       }
       const apology = `
 ## 📅 Seasonal Guide Unavailable
@@ -1037,7 +1101,7 @@ Do not write a massive month-by-month table or huge essays. Keep the entire resp
 We are sincerely sorry, but our seasonal AI advisor is temporarily offline.
 **Reason:** ${reason}
 
-* **For Developers:** Please check that your \`OPENROUTER_API_KEY\` or \`GROK_API_KEY\` is configured and active in your backend settings.
+* **For Developers:** Please check that your \`OPENROUTER_API_KEY\` or \`GROQ_API_KEY\` is configured and active in your backend settings.
 * **For Travelers:** Please try checking back later or explore another destination tab!
 `;
       onChunk(apology);
@@ -1055,11 +1119,12 @@ We are sincerely sorry, but our seasonal AI advisor is temporarily offline.
       const controller = new AbortController();
       const streamTimer = setTimeout(() => {
         controller.abort();
-        this.logger.warn('Grok stream read timeout — aborting SSE loop');
+        this.logger.warn('[Internal Groq] stream read timeout — aborting SSE loop');
       }, this.GROK_STREAM_READ_TIMEOUT_MS);
 
       let res: Response;
       try {
+        this.logger.log(`[Internal Groq] Streaming chat completion (${config.model})...`);
         res = await fetch(config.url, {
           method: 'POST',
           headers: config.headers,
@@ -1120,7 +1185,7 @@ We are sincerely sorry, but our seasonal AI advisor is temporarily offline.
       return true;
     } catch (err: any) {
       this.tripGrokCircuit(err.message);
-      this.logger.error(`Grok stream error: ${err.message} — falling back to OpenRouter`);
+      this.logger.error(`[Internal Groq] Stream error: ${err.message} — falling back to OpenRouter`);
       return false;
     }
   }
@@ -1139,22 +1204,28 @@ We are sincerely sorry, but our seasonal AI advisor is temporarily offline.
   }
   private async callOpenRouterChatStream(system: string, contents: any[], onChunk: (text: string) => void): Promise<boolean> {
     if (!this.openRouterService.hasKey) {
-      this.logger.warn('callOpenRouterChatStream: No OPENROUTER_API_KEY configured');
+      this.logger.warn('[OpenRouter Fallback] No OPENROUTER_API_KEY configured');
       return false;
     }
 
-    const messages: OpenRouterMessage[] = [
-      { role: 'system', content: system },
-      ...contents.map(c => ({
-        role: (c.role === 'model' || c.role === 'assistant' ? 'assistant' : 'user') as 'assistant' | 'user',
-        content: c.parts ? c.parts.map((p: any) => p.text).join('') : (c.content || ''),
-      }))
-    ];
+    await this.acquireOpenRouterFallbackSlot();
+    try {
+      this.logger.log(`[OpenRouter Fallback] Streaming chat completion (${this.openRouterService.getModel()})...`);
+      const messages: OpenRouterMessage[] = [
+        { role: 'system', content: system },
+        ...contents.map(c => ({
+          role: (c.role === 'model' || c.role === 'assistant' ? 'assistant' : 'user') as 'assistant' | 'user',
+          content: c.parts ? c.parts.map((p: any) => p.text).join('') : (c.content || ''),
+        }))
+      ];
 
-    return await this.openRouterService.chatStream({
-      messages,
-      onChunk,
-    });
+      return await this.openRouterService.chatStream({
+        messages,
+        onChunk,
+      });
+    } finally {
+      this.releaseOpenRouterFallbackSlot();
+    }
   }
 
   private async streamMockSummary(trip: any, context: string, onChunk: (text: string) => void, onComplete: () => void) {
@@ -1336,7 +1407,7 @@ Output your answer in raw JSON format matching this schema:
       : '';
 
     const openrouterKey = this.configService.get<string>('OPENROUTER_API_KEY');
-    const grokKey = this.configService.get<string>('GROK_API_KEY');
+    const grokKey = this.configService.get<string>('GROQ_API_KEY');
     const hasKey = (openrouterKey && openrouterKey.trim() !== '') || (grokKey && grokKey.trim() !== '');
 
     if (hasKey) {
@@ -1462,7 +1533,9 @@ ${transportByBudget}
 ${itineraryText ? `Itinerary:\n${itineraryText}\n` : ''}
 
 Your task:
-1. Identify the MAIN GATEWAY airport the traveller flies to commercially (e.g., for "Kailash Mansarovar" → Kathmandu KTM is the gateway. Simikot/Taklakot have NO commercial airline flights).
+1. Identify the MAIN GATEWAY airport the traveller flies to commercially.
+   CRITICAL: If the Destination parameter is a country or region (e.g. "Thailand", "Vietnam", "Japan", "Europe", "India"), inspect the Itinerary to find the FIRST arrival city with an international airport (e.g. Bangkok BKK, Tokyo HND/NRT, Hanoi HAN, Paris CDG) for the outbound flight(s), and the LAST departure city where the trip ends (e.g. Bangkok BKK, Phuket HKT) for the return flight(s).
+   NEVER use country names or 2-letter country codes (e.g. never output "Thailand" or "TH"). Always use specific city names and genuine 3-letter IATA airport codes.
 2. Check if a direct commercial flight exists from origin to gateway. If NOT, add HUB city legs (e.g., Bhubaneswar→Delhi→Kathmandu).
 3. Based on the BUDGET RULES above, decide if any additional transport legs (helicopter, small charter, domestic aircraft) should be included as separate legs.
 4. Build OUTBOUND legs (commercial/charter hops only), then RETURN legs (reverse route, on toDate).
@@ -1515,31 +1588,125 @@ Rules:
     return null;
   }
 
-  public fallbackFlightLegs(trip: { origin: string; destination: string; fromDate: string; toDate: string }): FlightLegsDto {
-    // Simple direct + return fallback using static IATA mapping
-    const STATIC: Record<string, string> = {
-      'bhubaneswar': 'BBI', 'bhubaneshwar': 'BBI', 'cuttack': 'BBI',
-      'delhi': 'DEL', 'new delhi': 'DEL', 'mumbai': 'BOM', 'kolkata': 'CCU',
-      'kathmandu': 'KTM', 'nepal': 'KTM', 'kailash': 'KTM', 'kailash mansarovar': 'KTM',
-      'london': 'LHR', 'paris': 'CDG', 'dubai': 'DXB', 'singapore': 'SIN',
-      'sydney': 'SYD', 'tokyo': 'HND', 'bangkok': 'BKK', 'new york': 'JFK',
-    };
-    const code = (s: string) => {
-      const l = s.toLowerCase();
-      for (const [k, v] of Object.entries(STATIC)) if (l.includes(k)) return v;
-      return s.substring(0, 3).toUpperCase();
+  public fallbackFlightLegs(trip: { origin: string; destination: string; fromDate: string; toDate: string; combinedPlan?: string | null }): FlightLegsDto {
+    const STATIC_GATEWAYS: Record<string, { city: string; iata: string }> = {
+      'thailand': { city: 'Bangkok', iata: 'BKK' },
+      'bangkok': { city: 'Bangkok', iata: 'BKK' },
+      'phuket': { city: 'Phuket', iata: 'HKT' },
+      'chiang mai': { city: 'Chiang Mai', iata: 'CNX' },
+      'pattaya': { city: 'Bangkok', iata: 'BKK' },
+      'krabi': { city: 'Krabi', iata: 'KBV' },
+      'samui': { city: 'Koh Samui', iata: 'USM' },
+      'vietnam': { city: 'Hanoi', iata: 'HAN' },
+      'hanoi': { city: 'Hanoi', iata: 'HAN' },
+      'ho chi minh': { city: 'Ho Chi Minh City', iata: 'SGN' },
+      'da nang': { city: 'Da Nang', iata: 'DAD' },
+      'japan': { city: 'Tokyo', iata: 'HND' },
+      'tokyo': { city: 'Tokyo', iata: 'HND' },
+      'kyoto': { city: 'Osaka/Kyoto', iata: 'KIX' },
+      'osaka': { city: 'Osaka', iata: 'KIX' },
+      'indonesia': { city: 'Bali', iata: 'DPS' },
+      'bali': { city: 'Bali', iata: 'DPS' },
+      'jakarta': { city: 'Jakarta', iata: 'CGK' },
+      'maldives': { city: 'Male', iata: 'MLE' },
+      'male': { city: 'Male', iata: 'MLE' },
+      'sri lanka': { city: 'Colombo', iata: 'CMB' },
+      'colombo': { city: 'Colombo', iata: 'CMB' },
+      'nepal': { city: 'Kathmandu', iata: 'KTM' },
+      'kathmandu': { city: 'Kathmandu', iata: 'KTM' },
+      'kailash': { city: 'Kathmandu', iata: 'KTM' },
+      'kailash mansarovar': { city: 'Kathmandu', iata: 'KTM' },
+      'singapore': { city: 'Singapore', iata: 'SIN' },
+      'malaysia': { city: 'Kuala Lumpur', iata: 'KUL' },
+      'kuala lumpur': { city: 'Kuala Lumpur', iata: 'KUL' },
+      'dubai': { city: 'Dubai', iata: 'DXB' },
+      'uae': { city: 'Dubai', iata: 'DXB' },
+      'united arab emirates': { city: 'Dubai', iata: 'DXB' },
+      'abu dhabi': { city: 'Abu Dhabi', iata: 'AUH' },
+      'uk': { city: 'London', iata: 'LHR' },
+      'united kingdom': { city: 'London', iata: 'LHR' },
+      'england': { city: 'London', iata: 'LHR' },
+      'london': { city: 'London', iata: 'LHR' },
+      'france': { city: 'Paris', iata: 'CDG' },
+      'paris': { city: 'Paris', iata: 'CDG' },
+      'italy': { city: 'Rome', iata: 'FCO' },
+      'rome': { city: 'Rome', iata: 'FCO' },
+      'spain': { city: 'Barcelona', iata: 'BCN' },
+      'barcelona': { city: 'Barcelona', iata: 'BCN' },
+      'madrid': { city: 'Madrid', iata: 'MAD' },
+      'germany': { city: 'Frankfurt', iata: 'FRA' },
+      'frankfurt': { city: 'Frankfurt', iata: 'FRA' },
+      'berlin': { city: 'Berlin', iata: 'BER' },
+      'switzerland': { city: 'Zurich', iata: 'ZRH' },
+      'zurich': { city: 'Zurich', iata: 'ZRH' },
+      'usa': { city: 'New York', iata: 'JFK' },
+      'united states': { city: 'New York', iata: 'JFK' },
+      'new york': { city: 'New York', iata: 'JFK' },
+      'australia': { city: 'Sydney', iata: 'SYD' },
+      'sydney': { city: 'Sydney', iata: 'SYD' },
+      'south korea': { city: 'Seoul', iata: 'ICN' },
+      'korea': { city: 'Seoul', iata: 'ICN' },
+      'seoul': { city: 'Seoul', iata: 'ICN' },
+      'turkey': { city: 'Istanbul', iata: 'IST' },
+      'istanbul': { city: 'Istanbul', iata: 'IST' },
+      'egypt': { city: 'Cairo', iata: 'CAI' },
+      'cairo': { city: 'Cairo', iata: 'CAI' },
+      'kolkata': { city: 'Kolkata', iata: 'CCU' },
+      'delhi': { city: 'Delhi', iata: 'DEL' },
+      'new delhi': { city: 'Delhi', iata: 'DEL' },
+      'mumbai': { city: 'Mumbai', iata: 'BOM' },
+      'bhubaneswar': { city: 'Bhubaneswar', iata: 'BBI' },
+      'bhubaneshwar': { city: 'Bhubaneswar', iata: 'BBI' },
+      'cuttack': { city: 'Bhubaneswar', iata: 'BBI' },
+      'bengaluru': { city: 'Bengaluru', iata: 'BLR' },
+      'bangalore': { city: 'Bengaluru', iata: 'BLR' },
+      'chennai': { city: 'Chennai', iata: 'MAA' },
+      'hyderabad': { city: 'Hyderabad', iata: 'HYD' },
+      'goa': { city: 'Goa', iata: 'GOI' },
+      'kochi': { city: 'Kochi', iata: 'COK' },
+      'jaipur': { city: 'Jaipur', iata: 'JAI' },
+      'lucknow': { city: 'Lucknow', iata: 'LKO' },
+      'ahmedabad': { city: 'Ahmedabad', iata: 'AMD' },
+      'amritsar': { city: 'Amritsar', iata: 'ATQ' },
+      'guwahati': { city: 'Guwahati', iata: 'GAU' },
+      'srinagar': { city: 'Srinagar', iata: 'SXR' },
+      'leh': { city: 'Leh', iata: 'IXL' },
+      'ladakh': { city: 'Leh', iata: 'IXL' },
+      'port blair': { city: 'Port Blair', iata: 'IXZ' },
+      'andaman': { city: 'Port Blair', iata: 'IXZ' },
+      'varanasi': { city: 'Varanasi', iata: 'VNS' },
     };
 
-    const orgIata  = code(trip.origin);
-    const destIata = code(trip.destination);
-    const orgCity  = trip.origin.split(',')[0].trim();
-    const destCity = trip.destination.split(',')[0].trim();
+    const resolveLocation = (raw: string, planText?: string | null) => {
+      const l = (raw || '').toLowerCase().trim();
+      // If planText is provided, look for mentioned cities in the itinerary first
+      if (planText) {
+        const lowerPlan = planText.toLowerCase();
+        for (const [k, v] of Object.entries(STATIC_GATEWAYS)) {
+          if (k.length > 3 && lowerPlan.includes(k)) {
+            return v;
+          }
+        }
+      }
+      for (const [k, v] of Object.entries(STATIC_GATEWAYS)) {
+        if (l === k || l.includes(k) || k.includes(l)) return v;
+      }
+      const rawCity = raw.split(',')[0].trim();
+      const iataMatch = raw.match(/\b([A-Z]{3})\b/);
+      return {
+        city: rawCity,
+        iata: iataMatch ? iataMatch[1] : (rawCity.length === 3 ? rawCity.toUpperCase() : 'BKK'),
+      };
+    };
+
+    const orgInfo = resolveLocation(trip.origin);
+    const destInfo = resolveLocation(trip.destination, trip.combinedPlan);
 
     return {
-      gateway: destCity,
-      gatewayIata: destIata,
-      outbound: [{ legNum: 1, from: orgCity,  fromIata: orgIata,  to: destCity, toIata: destIata, date: trip.fromDate, note: 'Commercial flight' }],
-      return:   [{ legNum: 2, from: destCity, fromIata: destIata, to: orgCity,  toIata: orgIata,  date: trip.toDate,   note: 'Return flight' }],
+      gateway: destInfo.city,
+      gatewayIata: destInfo.iata,
+      outbound: [{ legNum: 1, from: orgInfo.city, fromIata: orgInfo.iata, to: destInfo.city, toIata: destInfo.iata, date: trip.fromDate, note: 'Commercial flight' }],
+      return:   [{ legNum: 2, from: destInfo.city, fromIata: destInfo.iata, to: orgInfo.city, toIata: orgInfo.iata, date: trip.toDate,   note: 'Return flight' }],
       groundSegments: [],
     };
   }
@@ -1557,10 +1724,20 @@ Rules:
   ): Promise<ItineraryStopDto[]> {
     const itineraryText = this.extractSection(combinedPlan, 'itinerary');
     if (!itineraryText) {
+      this.logger.log(`[Deterministic] No itinerary section found, using fallback stop for ${destination}`);
       return this.buildFallbackStop(destination, fromDate, toDate);
     }
 
+    // 1. Deterministic-first: Try fast regex extraction with comprehensive city keyword dictionary
+    const regexStops = this.regexExtractStops(itineraryText, fromDate, toDate, destination);
+    if (regexStops.length > 0 && !(regexStops.length === 1 && regexStops[0].city.toLowerCase() === destination.toLowerCase())) {
+      this.logger.log(`[Deterministic] Extracted ${regexStops.length} itinerary stops via regex: ${regexStops.map(s => s.city).join(', ')}`);
+      return regexStops;
+    }
+
+    // 2. Fallback to AI stop parser if regex extraction could not identify distinct stops
     try {
+      this.logger.log(`[Internal Groq] Parsing itinerary stops via AI model...`);
       const prompt = `You are a travel itinerary parser. Given the following day-by-day travel itinerary, extract each UNIQUE city/destination where the traveller will STAY OVERNIGHT (i.e., needs a hotel). Group consecutive days in the same city.
 
 Trip start date: ${fromDate}
@@ -1576,8 +1753,9 @@ Return a JSON array of objects with this schema:
 ]
 
 Rules:
+- If the overall destination is a country (e.g. "Thailand", "Vietnam", "Japan"), you MUST extract the actual distinct cities visited (e.g., "Bangkok", "Phuket", "Chiang Mai", "Hanoi", "Tokyo"). NEVER output country names as the city.
 - Only include cities where the traveller actually SLEEPS (needs a hotel/guesthouse). Exclude transit-only stops.
-- "city" must be the real geographic city/town name — NOT words like "Arrival", "Departure", "Leisure", "Exploration", "Rest".
+- "city" must be the real geographic city/town name — NOT words like "Arrival", "Departure", "Leisure", "Exploration", "Rest", "Thailand", "Vietnam", "Japan", etc.
 - Group consecutive days spent in the same city into ONE entry.
 - Day numbers refer to the trip day (Day 1 = first day of trip).
 - If unsure about exact city, use the nearest well-known city.
@@ -1594,10 +1772,10 @@ Rules:
         return this.computeDates(parsed, fromDate);
       }
     } catch (e: any) {
-      this.logger.warn(`AI stop extraction failed: ${e.message}. Using regex fallback.`);
+      this.logger.warn(`AI stop extraction failed: ${e.message}. Using regex stops fallback.`);
     }
 
-    return this.regexExtractStops(itineraryText, fromDate, toDate, destination);
+    return regexStops.length > 0 ? regexStops : this.regexExtractStops(itineraryText, fromDate, toDate, destination);
   }
 
   private regexExtractStops(
@@ -1608,39 +1786,46 @@ Rules:
   ): ItineraryStopDto[] {
     // Known city keywords for Himalayan and global trips
     const CITY_KEYWORDS: Record<string, string> = {
-      'kathmandu': 'Kathmandu', 'ktm': 'Kathmandu',
-      'pokhara': 'Pokhara', 'lhasa': 'Lhasa',
-      'delhi': 'Delhi', 'new delhi': 'Delhi',
-      'mumbai': 'Mumbai', 'kolkata': 'Kolkata',
-      'bhubaneswar': 'Bhubaneswar', 'bhubaneshwar': 'Bhubaneswar',
-      'cuttack': 'Cuttack',
+      'bangkok': 'Bangkok', 'phuket': 'Phuket', 'chiang mai': 'Chiang Mai', 'krabi': 'Krabi',
+      'pattaya': 'Pattaya', 'samui': 'Koh Samui', 'koh samui': 'Koh Samui', 'hua hin': 'Hua Hin',
+      'hanoi': 'Hanoi', 'ho chi minh': 'Ho Chi Minh City', 'da nang': 'Da Nang', 'hoi an': 'Hoi An',
+      'nha trang': 'Nha Trang', 'phu quoc': 'Phu Quoc', 'siem reap': 'Siem Reap', 'phnom penh': 'Phnom Penh',
+      'bali': 'Bali', 'ubud': 'Ubud', 'seminyak': 'Seminyak', 'kuta': 'Kuta', 'canggu': 'Canggu', 'jakarta': 'Jakarta',
+      'singapore': 'Singapore', 'kuala lumpur': 'Kuala Lumpur', 'penang': 'Penang', 'langkawi': 'Langkawi',
+      'tokyo': 'Tokyo', 'kyoto': 'Kyoto', 'osaka': 'Osaka', 'hiroshima': 'Hiroshima', 'sapporo': 'Sapporo', 'nara': 'Nara',
+      'seoul': 'Seoul', 'busan': 'Busan', 'jeju': 'Jeju',
+      'male': 'Male', 'colombo': 'Colombo', 'kandy': 'Kandy', 'galle': 'Galle', 'nuwara eliya': 'Nuwara Eliya',
+      'kathmandu': 'Kathmandu', 'ktm': 'Kathmandu', 'pokhara': 'Pokhara', 'lhasa': 'Lhasa',
+      'delhi': 'Delhi', 'new delhi': 'Delhi', 'mumbai': 'Mumbai', 'kolkata': 'Kolkata',
+      'bhubaneswar': 'Bhubaneswar', 'bhubaneshwar': 'Bhubaneswar', 'cuttack': 'Cuttack',
       'simikot': 'Simikot', 'nepalganj': 'Nepalgunj', 'nepalgunj': 'Nepalgunj',
-      'hilsa': 'Hilsa',
-      'taklakot': 'Taklakot', 'purang': 'Purang',
+      'hilsa': 'Hilsa', 'taklakot': 'Taklakot', 'purang': 'Purang',
       'darchen': 'Darchen', 'mansarovar': 'Kailash Mansarovar', 'kailash': 'Kailash Mansarovar',
       'nyalam': 'Nyalam', 'saga': 'Saga', 'shigatse': 'Shigatse',
-      'london': 'London', 'paris': 'Paris', 'rome': 'Rome',
-      'tokyo': 'Tokyo', 'kyoto': 'Kyoto', 'osaka': 'Osaka',
-      'sydney': 'Sydney', 'melbourne': 'Melbourne', 'brisbane': 'Brisbane',
-      'new york': 'New York', 'los angeles': 'Los Angeles', 'chicago': 'Chicago',
-      'singapore': 'Singapore', 'bangkok': 'Bangkok', 'bali': 'Bali',
-      'dubai': 'Dubai', 'abu dhabi': 'Abu Dhabi',
-      'amsterdam': 'Amsterdam', 'barcelona': 'Barcelona', 'berlin': 'Berlin',
-      'istanbul': 'Istanbul', 'cairo': 'Cairo',
-      'leh': 'Leh', 'ladakh': 'Leh', 'srinagar': 'Srinagar',
-      'manali': 'Manali', 'shimla': 'Shimla',
-      'jaipur': 'Jaipur', 'agra': 'Agra', 'varanasi': 'Varanasi',
-      'goa': 'Goa', 'kochi': 'Kochi', 'lucknow': 'Lucknow',
-      'kuala lumpur': 'Kuala Lumpur', 'jakarta': 'Jakarta',
-      'ho chi minh': 'Ho Chi Minh City', 'hanoi': 'Hanoi',
-      'seoul': 'Seoul', 'beijing': 'Beijing', 'shanghai': 'Shanghai',
+      'london': 'London', 'paris': 'Paris', 'rome': 'Rome', 'florence': 'Florence', 'venice': 'Venice', 'milan': 'Milan',
+      'barcelona': 'Barcelona', 'madrid': 'Madrid', 'seville': 'Seville',
+      'amsterdam': 'Amsterdam', 'berlin': 'Berlin', 'munich': 'Munich', 'frankfurt': 'Frankfurt',
+      'zurich': 'Zurich', 'lucerne': 'Lucerne', 'interlaken': 'Interlaken', 'geneva': 'Geneva',
+      'vienna': 'Vienna', 'prague': 'Prague', 'budapest': 'Budapest',
+      'dubai': 'Dubai', 'abu dhabi': 'Abu Dhabi', 'doha': 'Doha', 'istanbul': 'Istanbul', 'cappadocia': 'Cappadocia', 'cairo': 'Cairo',
+      'sydney': 'Sydney', 'melbourne': 'Melbourne', 'brisbane': 'Brisbane', 'auckland': 'Auckland', 'queenstown': 'Queenstown',
+      'new york': 'New York', 'los angeles': 'Los Angeles', 'chicago': 'Chicago', 'san francisco': 'San Francisco',
+      'leh': 'Leh', 'ladakh': 'Leh', 'srinagar': 'Srinagar', 'gulmarg': 'Gulmarg', 'pahalgam': 'Pahalgam',
+      'manali': 'Manali', 'shimla': 'Shimla', 'dharamshala': 'Dharamshala', 'spiti': 'Spiti Valley',
+      'jaipur': 'Jaipur', 'udaipur': 'Udaipur', 'jodhpur': 'Jodhpur', 'jaisalmer': 'Jaisalmer', 'agra': 'Agra', 'varanasi': 'Varanasi',
+      'goa': 'Goa', 'kochi': 'Kochi', 'munnar': 'Munnar', 'alleppey': 'Alleppey', 'wayanad': 'Wayanad', 'lucknow': 'Lucknow',
+      'port blair': 'Port Blair', 'havelock': 'Havelock Island', 'neil island': 'Neil Island',
+      'beijing': 'Beijing', 'shanghai': 'Shanghai',
     };
 
-    // INVALID non-city words that regex/OpenRouter might incorrectly pick up
+    // INVALID non-city and country words that regex/OpenRouter might incorrectly pick up
     const INVALID_CITIES = new Set([
       'arrival', 'departure', 'leisure', 'rest', 'acclimatization', 'exploration',
       'sightseeing', 'transfer', 'transit', 'journey', 'excursion', 'day',
       'return', 'welcome', 'farewell', 'flight', 'check', 'morning', 'evening',
+      'thailand', 'vietnam', 'japan', 'indonesia', 'france', 'italy', 'spain', 'germany',
+      'switzerland', 'india', 'nepal', 'maldives', 'sri lanka', 'singapore', 'malaysia',
+      'australia', 'united states', 'usa', 'uk', 'united kingdom', 'europe', 'asia',
     ]);
 
     const rawDays: Array<{ day: number; city: string }> = [];
@@ -1737,6 +1922,42 @@ Rules:
   }
 
   public buildFallbackStop(destination: string, fromDate: string, toDate: string): ItineraryStopDto[] {
+    const COUNTRY_GATEWAYS: Record<string, string> = {
+      'thailand': 'Bangkok',
+      'vietnam': 'Hanoi',
+      'japan': 'Tokyo',
+      'indonesia': 'Bali',
+      'bali': 'Bali',
+      'maldives': 'Male',
+      'sri lanka': 'Colombo',
+      'nepal': 'Kathmandu',
+      'singapore': 'Singapore',
+      'malaysia': 'Kuala Lumpur',
+      'uae': 'Dubai',
+      'united arab emirates': 'Dubai',
+      'uk': 'London',
+      'united kingdom': 'London',
+      'france': 'Paris',
+      'italy': 'Rome',
+      'spain': 'Barcelona',
+      'germany': 'Frankfurt',
+      'switzerland': 'Zurich',
+      'usa': 'New York',
+      'united states': 'New York',
+      'australia': 'Sydney',
+      'south korea': 'Seoul',
+      'korea': 'Seoul',
+    };
+
+    const destLower = (destination || '').toLowerCase().trim();
+    let resolvedCity = destination;
+    for (const [country, city] of Object.entries(COUNTRY_GATEWAYS)) {
+      if (destLower === country || destLower.includes(country)) {
+        resolvedCity = city;
+        break;
+      }
+    }
+
     const ci = new Date(fromDate || Date.now());
     const co = new Date(toDate || Date.now());
     if (isNaN(co.getTime())) co.setDate(ci.getDate() + 1);
@@ -1751,7 +1972,7 @@ Rules:
       d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
 
     return [{
-      city: destination,
+      city: resolvedCity,
       dayStart: 1,
       dayEnd: 1,
       checkin: fmtISO(ci),
