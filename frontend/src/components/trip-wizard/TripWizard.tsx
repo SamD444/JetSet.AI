@@ -121,7 +121,7 @@ export default function TripWizard() {
             }
             
             if (data.proactiveMessage) {
-                addMessage({ role: 'model', content: data.proactiveMessage });
+                addMessage({ role: 'assistant', content: data.proactiveMessage });
                 setIsOpen(true);
             }
         } catch (error) {
