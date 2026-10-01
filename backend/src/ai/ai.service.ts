@@ -719,7 +719,7 @@ Return ONLY a JSON object with this exact structure:
         if (geminiKey && (file.mimetype.startsWith('image/') || file.mimetype === 'application/pdf')) {
           const ai = new GoogleGenAI({ apiKey: geminiKey });
           const geminiModels = ['gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-3.6-flash'];
-          let geminiSuccess = false;
+          let geminiResponse: string | undefined;
 
           for (const model of geminiModels) {
             for (let attempt = 0; attempt < 2; attempt++) {
@@ -737,8 +737,7 @@ Return ONLY a JSON object with this exact structure:
                     }
                   ]
                 });
-                response = result.text || '';
-                geminiSuccess = true;
+                geminiResponse = result.text || '';
                 break;
               } catch (e: any) {
                 const is503 = e.message?.includes('503') || e.message?.includes('UNAVAILABLE') || e.message?.includes('high demand');
@@ -750,10 +749,12 @@ Return ONLY a JSON object with this exact structure:
                 break; // non-503 error or second attempt, try next model
               }
             }
-            if (geminiSuccess) break;
+            if (geminiResponse !== undefined) break;
           }
 
-          if (!geminiSuccess) {
+          if (geminiResponse !== undefined) {
+            response = geminiResponse;
+          } else {
             this.logger.warn('All Gemini models unavailable, falling back to Groq text fallback...');
             response = await this.callModelWithFallback(prompt, 'You are a multimodal travel document analyzer.', true);
           }
