@@ -13,6 +13,8 @@ import { RagModule } from './rag/rag.module';
 import { OpenRouterModule } from './openrouter/openrouter.module';
 import { AiModule } from './ai/ai.module';
 import { CopilotModule } from './copilot/copilot.module';
+import { RuralStaysModule } from './rural-stays/rural-stays.module';
+import { TransitModule } from './transit/transit.module';
 
 @Module({
   imports: [
@@ -114,6 +116,8 @@ import { CopilotModule } from './copilot/copilot.module';
     RagModule,
     AiModule,
     CopilotModule,
+    RuralStaysModule,
+    TransitModule,
   ],
   controllers: [AppController],
   providers: [AppService],

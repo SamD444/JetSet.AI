@@ -737,7 +737,7 @@ ${contextString}
     }
 
     try {
-      let response: string;
+      let response: string = '';
 
       if (barcodeStr) {
         this.logger.log(`Barcode detected: ${barcodeStr}`);
