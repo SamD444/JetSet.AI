@@ -25,6 +25,34 @@ export const JettyMascot: React.FC<JettyMascotProps> = ({
     large: 'w-24 h-24 md:w-32 md:h-32'
   };
 
+  const getMascotSrc = (st: JettyState): string => {
+    switch (st) {
+      case 'greeting':
+        return '/mascot/jetty-wave.png';
+      case 'hover':
+        return '/mascot/jetty-happy.png';
+      case 'thinking':
+        return '/mascot/jetty-thinking.png';
+      case 'talking':
+        return '/mascot/jetty-talking.png';
+      case 'listening':
+        return '/mascot/jetty-listening.png';
+      case 'happy':
+        return '/mascot/jetty-happy.png';
+      case 'excited':
+        return '/mascot/jetty-excited.png';
+      case 'confused':
+        return '/mascot/jetty-confused.png';
+      case 'error':
+        return '/mascot/jetty-error.png';
+      case 'sleepy':
+        return '/mascot/jetty-sleepy.png';
+      case 'idle':
+      default:
+        return '/mascot/jetty-idle.png';
+    }
+  };
+
   return (
     <div 
       className={`relative inline-block ${sizeClasses[size]} ${className}`}
@@ -44,12 +72,14 @@ export const JettyMascot: React.FC<JettyMascotProps> = ({
       <div className={`w-full h-full relative jetty-${state} transition-opacity duration-300`}>
         {/* Render the specific mascot state image */}
         <img 
-          src={`/mascot/jetty-${state}.png`} 
+          src={getMascotSrc(state)} 
           alt={`Jetty is ${state}`}
           className="w-full h-full object-contain drop-shadow-2xl"
           onError={(e) => {
-            // Fallback to idle if specific state image fails to load
-            (e.target as HTMLImageElement).src = '/mascot/jetty-idle.png';
+            const target = e.target as HTMLImageElement;
+            if (!target.src.endsWith('/mascot/jetty-idle.png')) {
+              target.src = '/mascot/jetty-idle.png';
+            }
           }}
         />
 

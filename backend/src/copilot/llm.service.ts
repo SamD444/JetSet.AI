@@ -21,9 +21,10 @@ export class LlmService {
     messages: any[],
     systemPrompt: string,
     abortSignal?: AbortSignal,
+    reqId?: string,
   ): Promise<any> {
     try {
-      this.logger.log('[Tuffy Groq] Starting chat completion stream');
+      this.logger.log(`[Tuffy Groq] Starting chat completion stream requestId=${reqId || 'unknown'}`);
       const stream = await this.groq.chat.completions.create(
         {
           messages: [
@@ -164,7 +165,11 @@ export class LlmService {
       );
       return stream;
     } catch (error) {
-      this.logger.error('[Tuffy Groq] Error in Groq stream', error);
+      if (abortSignal?.aborted || (error as any)?.name === 'AbortError' || (error as any)?.name === 'APIUserAbortError') {
+        this.logger.warn(`[Tuffy Groq] Stream aborted for requestId=${reqId || 'unknown'}`);
+      } else {
+        this.logger.error(`[Tuffy Groq] Error in Groq stream requestId=${reqId || 'unknown'}`, error);
+      }
       throw error;
     }
   }

@@ -46,12 +46,28 @@ export class CopilotController {
       } catch {}
     }
 
+    const reqId = (req.headers['x-request-id'] as string) || `req_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const clientAbortController = new AbortController();
+
+    req.on('close', () => {
+      if (!res.writableEnded) {
+        clientAbortController.abort();
+      }
+    });
+
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
     try {
-      const stream = await this.copilotService.handleStream(userId, messages, context, effectiveTripId);
+      const stream = await this.copilotService.handleStream(
+        userId, 
+        messages, 
+        context, 
+        effectiveTripId, 
+        clientAbortController.signal,
+        reqId
+      );
       
       const toolCallMap = new Map<number, { id: string; name: string; arguments: string }>();
       let streamedAnyContent = false;

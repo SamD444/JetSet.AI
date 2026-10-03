@@ -79,16 +79,38 @@ ${ragContextString}
     `;
   }
 
-  async handleStream(userId: string, messages: CopilotMessage[], contextData: string = '', tripId: string = '') {
+  async handleStream(
+    userId: string, 
+    messages: CopilotMessage[], 
+    contextData: string = '', 
+    tripId: string = '',
+    clientSignal?: AbortSignal,
+    reqId?: string,
+  ) {
     const isAllowed = await this.rateLimiter.checkLimit(userId);
     if (!isAllowed) {
       throw new HttpException('Rate limit exceeded', HttpStatus.TOO_MANY_REQUESTS);
     }
 
     const abortController = new AbortController();
-    const timeoutId = setTimeout(() => abortController.abort(), 15000); // 15s timeout circuit breaker
+    const timeoutId = setTimeout(() => {
+      this.logger.warn(`[CopilotService] Request ${reqId || ''} timed out after 60s`);
+      abortController.abort();
+    }, 60000); // 60s timeout circuit breaker
+
+    if (clientSignal) {
+      if (clientSignal.aborted) {
+        abortController.abort();
+      } else {
+        clientSignal.addEventListener('abort', () => {
+          this.logger.log(`[CopilotService] Request ${reqId || ''} aborted by client`);
+          abortController.abort();
+        }, { once: true });
+      }
+    }
 
     try {
+      this.logger.log(`[CopilotService] handleStream started requestId=${reqId || 'unknown'} user=${userId}`);
       // Extract destination from context if available
       let destination = '';
       let userQuery = '';
@@ -117,12 +139,17 @@ ${ragContextString}
       const stream = await this.llmService.getChatCompletionStream(
         messages, 
         systemPrompt, 
-        abortController.signal
+        abortController.signal,
+        reqId
       );
       
       return stream;
     } catch (error) {
-      this.logger.error('Error in CopilotService stream', error);
+      if (abortController.signal.aborted || (error as any)?.name === 'AbortError' || (error as any)?.name === 'APIUserAbortError') {
+        this.logger.warn(`[CopilotService] Stream aborted for requestId=${reqId || 'unknown'}`);
+      } else {
+        this.logger.error(`[CopilotService] Error in CopilotService stream requestId=${reqId || 'unknown'}`, error);
+      }
       throw error;
     } finally {
       clearTimeout(timeoutId);

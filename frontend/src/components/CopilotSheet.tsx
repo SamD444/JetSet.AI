@@ -41,7 +41,11 @@ export function CopilotSheet() {
   const { jettyState } = useJettyState();
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
+  const [statusText, setStatusText] = useState('Thinking...');
   const bottomRef = useRef<HTMLDivElement>(null);
+  const isSubmittingRef = useRef(false);
+  const activeAbortControllerRef = useRef<AbortController | null>(null);
+  const currentRequestIdRef = useRef<string | null>(null);
   const router = useRouter();
   
   const suggestedQuestions = useMemo(() => getSuggestedQuestions(activeRoute, activeView), [activeRoute, activeView]);
@@ -50,14 +54,44 @@ export function CopilotSheet() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isTyping]);
 
+  useEffect(() => {
+    return () => {
+      // Abort any in-flight request when component unmounts
+      if (activeAbortControllerRef.current) {
+        activeAbortControllerRef.current.abort();
+      }
+      isSubmittingRef.current = false;
+    };
+  }, []);
+
   const handleSend = async (overrideInput?: string) => {
     const textToSend = overrideInput || input;
     if (!textToSend.trim()) return;
+
+    // Guard: Prevent duplicate submission if a request is already actively processing
+    if (isSubmittingRef.current) {
+      console.warn('[Copilot] Duplicate submission blocked — active request already in progress');
+      return;
+    }
+
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    currentRequestIdRef.current = requestId;
+    isSubmittingRef.current = true;
+
+    // Abort previous controller if any was lingering
+    if (activeAbortControllerRef.current) {
+      activeAbortControllerRef.current.abort();
+    }
+    const abortController = new AbortController();
+    activeAbortControllerRef.current = abortController;
+
+    console.log(`[Copilot] submit requestId=${requestId}`);
 
     const userMsg: CopilotMessage = { role: 'user', content: textToSend };
     addMessage(userMsg);
     if (!overrideInput) setInput('');
     setIsTyping(true);
+    setStatusText('Thinking...');
     setIsStreaming(true);
 
     const token = localStorage.getItem('token') || 'dummy-token-for-now';
@@ -79,7 +113,6 @@ export function CopilotSheet() {
     const appendContent = (chunk: string) => {
       currentAssistantContent += chunk;
       if (!assistantAdded) {
-        setIsTyping(false); // Stop thinking spinner once content starts
         addMessage({ role: 'assistant', content: currentAssistantContent });
         assistantAdded = true;
       } else {
@@ -91,9 +124,11 @@ export function CopilotSheet() {
       const baseUrl = getApiUrl();
       await fetchEventSource(`${baseUrl}/copilot/stream`, {
         method: 'POST',
+        signal: abortController.signal,
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          'Authorization': `Bearer ${token}`,
+          'x-request-id': requestId
         },
         body: JSON.stringify({
           messages: conversation,
@@ -105,24 +140,41 @@ export function CopilotSheet() {
             documentContext
           })
         }),
+        async onopen(response) {
+          if (!response.ok) {
+            console.error(`[Copilot] stream open failed with status ${response.status}`);
+            throw new Error(`HTTP_${response.status}`);
+          }
+          console.log(`[Copilot] stream connected requestId=${requestId}`);
+        },
         onmessage(ev) {
+          // Ignore messages from older / superseded requests
+          if (currentRequestIdRef.current !== requestId) return;
+
           try {
             const payload: CopilotResponsePayload = JSON.parse(ev.data);
             if (payload.isDone) {
+              console.log(`[Copilot] stream completed requestId=${requestId}`);
               setIsTyping(false);
               setIsStreaming(false);
+              isSubmittingRef.current = false;
+              abortController.abort(); // Close SSE cleanly so fetchEventSource does not retry
               return;
             }
             if (payload.error) {
+              console.error(`[Copilot] stream error payload requestId=${requestId}:`, payload.error);
               setIsTyping(false);
               setIsStreaming(false);
+              isSubmittingRef.current = false;
               appendContent(`Error: ${payload.error}`);
+              abortController.abort();
               return;
             }
             if (payload.content) {
               appendContent(payload.content);
             }
             if (payload.itineraryUpdated && payload.updatedItinerary) {
+              setStatusText('Updating your itinerary...');
               window.dispatchEvent(new CustomEvent('copilot-itinerary-updated', {
                 detail: { updatedItinerary: payload.updatedItinerary, tripId }
               }));
@@ -131,26 +183,29 @@ export function CopilotSheet() {
               }, 300);
             }
             if (payload.tripUpdated && payload.updatedTrip) {
+              setStatusText('Updating your trip...');
               window.dispatchEvent(new CustomEvent('copilot-trip-updated', {
                 detail: payload.updatedTrip
               }));
             }
-            if (payload.toolCalls) {
+            if (payload.toolCalls && payload.toolCalls.length > 0) {
                const tool = payload.toolCalls[0];
                if (tool.function.name === 'navigate_to_page') {
-                 const args = JSON.parse(tool.function.arguments);
+                 const args = JSON.parse(tool.function.arguments || '{}');
                  if (args.path) {
                    router.push(args.path);
                    appendContent(`\n\n*Navigating to ${args.path}...*`);
                  }
                } else if (tool.function.name === 'switch_tab') {
-                 const args = JSON.parse(tool.function.arguments);
+                 const args = JSON.parse(tool.function.arguments || '{}');
+                 setStatusText(`Opening ${args.tabId || 'requested'} tab...`);
                  if (args.tabId) {
                    window.dispatchEvent(new CustomEvent('switch-tab', { detail: args.tabId }));
                    appendContent(`\n\n*Opening ${args.tabId} tab...*`);
                  }
                } else if (tool.function.name === 'modify_trip') {
-                 const args = JSON.parse(tool.function.arguments);
+                 const args = JSON.parse(tool.function.arguments || '{}');
+                 setStatusText('Updating your trip parameters...');
                  // Switch to the most relevant tab after modification
                  if (args.fromDate || args.toDate) {
                    setTimeout(() => window.dispatchEvent(new CustomEvent('switch-tab', { detail: 'flights' })), 800);
@@ -158,29 +213,51 @@ export function CopilotSheet() {
                    setTimeout(() => window.dispatchEvent(new CustomEvent('switch-tab', { detail: 'hotels' })), 800);
                  }
                } else if (tool.function.name === 'edit_itinerary') {
-                 const args = JSON.parse(tool.function.arguments);
-                 // Dispatch event so ItineraryModule can pick up the edit instruction
+                 const args = JSON.parse(tool.function.arguments || '{}');
+                 setStatusText('Updating your itinerary...');
                  window.dispatchEvent(new CustomEvent('copilot-edit-itinerary', { detail: args }));
                  setTimeout(() => window.dispatchEvent(new CustomEvent('switch-tab', { detail: 'itinerary' })), 600);
                } else {
-                 appendContent(` [Executing Tool: ${tool.function.name}]`);
+                 setStatusText('Working on your request...');
                }
             }
           } catch (e) {
-            console.error('Failed to parse SSE payload', e);
+            console.error('[Copilot] Failed to parse SSE payload', e);
           }
         },
+        onclose() {
+          console.log(`[Copilot] stream closed requestId=${requestId}`);
+          if (currentRequestIdRef.current === requestId) {
+            setIsTyping(false);
+            setIsStreaming(false);
+            isSubmittingRef.current = false;
+          }
+          // Throw error on close so fetchEventSource does NOT attempt reconnection
+          throw new Error('STREAM_DONE');
+        },
         onerror(err) {
-          console.error('SSE Error:', err);
-          setIsTyping(false);
-          setIsStreaming(false);
-          throw err; 
+          if (err?.message === 'STREAM_DONE' || abortController.signal.aborted) {
+            // Normal clean completion or intentional abort
+            return;
+          }
+          console.error(`[Copilot] SSE Error requestId=${requestId}:`, err);
+          if (currentRequestIdRef.current === requestId) {
+            setIsTyping(false);
+            setIsStreaming(false);
+            isSubmittingRef.current = false;
+          }
+          throw err; // Stop fetchEventSource retry loop
         }
       });
-    } catch (error) {
-      console.error(error);
-      setIsTyping(false);
-      setIsStreaming(false);
+    } catch (error: any) {
+      if (!abortController.signal.aborted && error?.message !== 'STREAM_DONE') {
+        console.error(`[Copilot] handleSend error requestId=${requestId}:`, error);
+      }
+      if (currentRequestIdRef.current === requestId) {
+        setIsTyping(false);
+        setIsStreaming(false);
+        isSubmittingRef.current = false;
+      }
     }
   };
 
@@ -229,7 +306,8 @@ export function CopilotSheet() {
                   <button 
                     key={idx}
                     onClick={() => handleSend(q)}
-                    className="w-full text-left p-3 rounded-xl bg-muted/50 hover:bg-muted border border-transparent hover:border-sky-500/30 transition-all text-sm flex items-center gap-3"
+                    disabled={isTyping}
+                    className="w-full text-left p-3 rounded-xl bg-muted/50 hover:bg-muted border border-transparent hover:border-sky-500/30 transition-all text-sm flex items-center gap-3 disabled:opacity-50 cursor-pointer"
                   >
                     <Navigation className="w-4 h-4 text-sky-500" />
                     {q}
@@ -270,11 +348,11 @@ export function CopilotSheet() {
                 );
               })}
               {isTyping && (
-                <div className="flex justify-start items-end gap-2">
-                  <JettyMascot state={jettyState} size="small" className="mb-1 shrink-0" />
+                <div className="flex justify-start items-end gap-2 animate-in fade-in duration-300">
+                  <JettyMascot state="thinking" size="small" className="mb-1 shrink-0" />
                   <div className="p-4 rounded-2xl bg-muted rounded-bl-sm border border-border flex items-center gap-2 shadow-sm">
                     <Loader2 className="h-4 w-4 animate-spin text-sky-500" />
-                    <span className="text-sm text-muted-foreground">Jetty is thinking...</span>
+                    <span className="text-sm text-muted-foreground">Jetty is {statusText.toLowerCase()}</span>
                   </div>
                 </div>
               )}
@@ -288,13 +366,14 @@ export function CopilotSheet() {
             <Input 
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+              onKeyDown={(e) => e.key === 'Enter' && !isTyping && handleSend()}
               placeholder="Ask Jetty anything..."
               className="pr-12 py-6 rounded-full border-muted-foreground/30 focus-visible:ring-sky-500"
+              disabled={isTyping}
             />
             <Button 
               size="icon"
-              className="absolute right-1 top-1 h-10 w-10 rounded-full bg-sky-600 hover:bg-sky-700" 
+              className="absolute right-1 top-1 h-10 w-10 rounded-full bg-sky-600 hover:bg-sky-700 cursor-pointer disabled:opacity-50" 
               onClick={() => handleSend()} 
               disabled={isTyping || !input.trim()}
             >
