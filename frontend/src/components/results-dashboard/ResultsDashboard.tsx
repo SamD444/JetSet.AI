@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Plane, Hotel, CloudSun, Map, Sparkles, AlertTriangle, Pencil, X, Loader2 } from "lucide-react";
+import { Plane, Hotel, CloudSun, Map, Sparkles, AlertTriangle, Pencil, X, Loader2, TrainFront } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
 // Modules
@@ -11,6 +11,7 @@ import HotelsModule from "./modules/HotelsModule";
 import SeasonModule from "./modules/SeasonModule";
 import ItineraryModule from "./modules/ItineraryModule";
 import SummaryModule from "./modules/SummaryModule";
+import TransitStaysModule from "./modules/TransitStaysModule";
 import { getApiUrl } from "@/utils/api";
 import { useCopilotStore } from "@/store/copilotStore";
 import { formatDisplayDates } from "@/lib/dateUtils";
@@ -30,6 +31,7 @@ const TABS = [
     { id: "hotels", label: "Stays", icon: Hotel, color: "text-emerald-400" },
     { id: "season", label: "When to Go", icon: CloudSun, color: "text-amber-400" },
     { id: "itinerary", label: "Itinerary", icon: Map, color: "text-cyan-400" },
+    { id: "transit", label: "Transit & Stays", icon: TrainFront, color: "text-teal-400" },
 ];
 
 export default function ResultsDashboard({ tripId, org, dest, dates, displayDates, curr }: ResultsDashboardProps) {
@@ -207,6 +209,14 @@ export default function ResultsDashboard({ tripId, org, dest, dates, displayDate
         highlightTimeoutRef.current = setTimeout(() => {
             setHighlightedTabs([]);
         }, 3000);
+    }, []);
+
+    useEffect(() => {
+        // Pre-fetch all other tabs in the background 100ms after initial mount
+        const timer = setTimeout(() => {
+            setVisitedTabs(["summary", "flights", "hotels", "season", "itinerary", "transit"]);
+        }, 100);
+        return () => clearTimeout(timer);
     }, []);
 
     useEffect(() => {
@@ -396,6 +406,15 @@ export default function ResultsDashboard({ tripId, org, dest, dates, displayDate
                                         org={tripState.origin} 
                                         dest={tripState.destination} 
                                         dates={tripState.dates} 
+                                    />
+                                )}
+                                {tab.id === "transit" && visitedTabs.includes("transit") && (
+                                    <TransitStaysModule
+                                        key={`transit-${tripState.origin}-${tripState.destination}-${tripState.fromDate}-${flightsVersion}`}
+                                        tripId={tripId}
+                                        org={tripState.origin}
+                                        dest={tripState.destination}
+                                        dates={tripState.dates}
                                     />
                                 )}
                             </motion.div>
