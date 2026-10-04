@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Plane, Hotel, CloudSun, Map, Sparkles, AlertTriangle, Pencil, X, Loader2 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
@@ -195,6 +195,20 @@ export default function ResultsDashboard({ tripId, org, dest, dates, displayDate
         }
     }, [tripId, tripState.destination]);
 
+    // Highlighting state for tabs affected by Jetty/Copilot actions
+    const [highlightedTabs, setHighlightedTabs] = useState<string[]>([]);
+    const highlightTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+    const triggerTabHighlight = useCallback((tabsToHighlight: string[]) => {
+        if (highlightTimeoutRef.current) {
+            clearTimeout(highlightTimeoutRef.current);
+        }
+        setHighlightedTabs(tabsToHighlight);
+        highlightTimeoutRef.current = setTimeout(() => {
+            setHighlightedTabs([]);
+        }, 3000);
+    }, []);
+
     useEffect(() => {
         const handleSwitchTab = (e: Event) => {
             const customEvent = e as CustomEvent;
@@ -204,24 +218,31 @@ export default function ResultsDashboard({ tripId, org, dest, dates, displayDate
                 if (!visitedTabs.includes(targetTab)) {
                     setVisitedTabs((prev) => [...prev, targetTab]);
                 }
+                triggerTabHighlight([targetTab]);
             }
         };
         window.addEventListener("switch-tab", handleSwitchTab);
         return () => window.removeEventListener("switch-tab", handleSwitchTab);
-    }, [visitedTabs]);
+    }, [visitedTabs, triggerTabHighlight]);
 
     // Synchronize with Copilot mutations (single canonical event)
     useEffect(() => {
         const handleTripUpdated = (e: Event) => {
             const detail = (e as CustomEvent).detail || {};
             applyCanonicalTripUpdate(detail);
+            const affected: string[] = [];
+            if (detail.fromDate || detail.toDate || detail.origin) affected.push("flights", "itinerary");
+            if (detail.destination) affected.push("summary", "flights", "hotels", "itinerary", "season");
+            if (detail.budget || detail.companions) affected.push("hotels");
+            if (affected.length === 0) affected.push("summary");
+            triggerTabHighlight(Array.from(new Set(affected)));
         };
 
         window.addEventListener("copilot-trip-updated", handleTripUpdated);
         return () => {
             window.removeEventListener("copilot-trip-updated", handleTripUpdated);
         };
-    }, [applyCanonicalTripUpdate]);
+    }, [applyCanonicalTripUpdate, triggerTabHighlight]);
 
     return (
         <div className="w-full flex flex-col items-center relative">
@@ -280,6 +301,7 @@ export default function ResultsDashboard({ tripId, org, dest, dates, displayDate
                         {TABS.map((tab) => {
                             const Icon = tab.icon;
                             const isActive = activeTab === tab.id;
+                            const isHighlighted = highlightedTabs.includes(tab.id);
                             return (
                                 <TabsTrigger
                                     key={tab.id}
@@ -288,16 +310,26 @@ export default function ResultsDashboard({ tripId, org, dest, dates, displayDate
                                         h-full rounded-xl px-4 md:px-6 transition-all duration-300 data-[state=active]:bg-white/10 data-[state=active]:text-white data-[state=active]:shadow-lg
                                         text-white/60 hover:text-white/80 border border-transparent data-[state=active]:border-white/10 relative overflow-hidden group
                                         cursor-pointer
+                                        ${isHighlighted ? 'ring-2 ring-sky-400 shadow-[0_0_20px_rgba(56,189,248,0.5)] border-sky-400/40 bg-sky-500/15' : ''}
                                     `}
                                 >
                                     <div className="flex items-center gap-2 md:gap-3 z-10 relative">
-                                        <Icon className={`w-5 h-5 transition-colors ${isActive ? tab.color : 'group-hover:text-white'}`} />
-                                        <span className={`font-medium hidden sm:block ${isActive ? 'text-white' : ''}`}>
+                                        <Icon className={`w-5 h-5 transition-colors ${isActive ? tab.color : 'group-hover:text-white'} ${isHighlighted ? 'text-sky-300' : ''}`} />
+                                        <span className={`font-medium hidden sm:block ${isActive ? 'text-white' : ''} ${isHighlighted ? 'text-sky-200 font-semibold' : ''}`}>
                                             {tab.label}
                                         </span>
                                     </div>
 
-                                    {isActive && (
+                                    {isHighlighted && (
+                                        <motion.div
+                                            className="absolute inset-0 rounded-xl bg-gradient-to-r from-sky-400/20 via-sky-300/30 to-violet-400/20 pointer-events-none z-0"
+                                            initial={{ opacity: 0 }}
+                                            animate={{ opacity: [0.3, 0.8, 0.3] }}
+                                            transition={{ duration: 1.5, repeat: Infinity, ease: "easeInOut" }}
+                                        />
+                                    )}
+
+                                    {isActive && !isHighlighted && (
                                         <motion.div
                                             layoutId="activeTabGlow"
                                             className="absolute inset-0 bg-white/5 z-0"

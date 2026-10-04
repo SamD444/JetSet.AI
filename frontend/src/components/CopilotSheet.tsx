@@ -47,6 +47,7 @@ export function CopilotSheet() {
   const isSubmittingRef = useRef(false);
   const activeAbortControllerRef = useRef<AbortController | null>(null);
   const currentRequestIdRef = useRef<string | null>(null);
+  const hasNavigatedOrSwitchedRef = useRef(false);
   const router = useRouter();
   const pathname = usePathname();
   
@@ -78,6 +79,7 @@ export function CopilotSheet() {
 
     const requestId = `req_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     currentRequestIdRef.current = requestId;
+    hasNavigatedOrSwitchedRef.current = false;
     isSubmittingRef.current = true;
 
     // Abort previous controller if any was lingering
@@ -160,6 +162,12 @@ export function CopilotSheet() {
               setIsTyping(false);
               setIsStreaming(false);
               isSubmittingRef.current = false;
+              // If an action that switched tabs or navigated pages successfully completed, smoothly minimize Jetty
+              if (hasNavigatedOrSwitchedRef.current) {
+                setTimeout(() => {
+                  setIsOpen(false);
+                }, 750);
+              }
               abortController.abort(); // Close SSE cleanly so fetchEventSource does not retry
               return;
             }
@@ -176,6 +184,7 @@ export function CopilotSheet() {
               appendContent(payload.content);
             }
             if (payload.itineraryUpdated && payload.updatedItinerary) {
+              hasNavigatedOrSwitchedRef.current = true;
               setStatusText('Updating your itinerary...');
               window.dispatchEvent(new CustomEvent('copilot-itinerary-updated', {
                 detail: { updatedItinerary: payload.updatedItinerary, tripId }
@@ -185,6 +194,7 @@ export function CopilotSheet() {
               }, 300);
             }
             if (payload.tripUpdated && payload.updatedTrip) {
+              hasNavigatedOrSwitchedRef.current = true;
               setStatusText('Updating your trip...');
               const updatedTrip = payload.updatedTrip;
               if (updatedTrip.id) {
@@ -213,12 +223,14 @@ export function CopilotSheet() {
             if (payload.toolCalls && payload.toolCalls.length > 0) {
                const tool = payload.toolCalls[0];
                if (tool.function.name === 'navigate_to_page') {
+                 hasNavigatedOrSwitchedRef.current = true;
                  const args = JSON.parse(tool.function.arguments || '{}');
                  if (args.path) {
                    router.push(args.path);
                    appendContent(`\n\n*Navigating to ${args.path}...*`);
                  }
                } else if (tool.function.name === 'switch_tab') {
+                 hasNavigatedOrSwitchedRef.current = true;
                  const args = JSON.parse(tool.function.arguments || '{}');
                  setStatusText(`Opening ${args.tabId || 'requested'} tab...`);
                  if (args.tabId) {
@@ -226,6 +238,7 @@ export function CopilotSheet() {
                    appendContent(`\n\n*Opening ${args.tabId} tab...*`);
                  }
                } else if (tool.function.name === 'modify_trip') {
+                 hasNavigatedOrSwitchedRef.current = true;
                  const args = JSON.parse(tool.function.arguments || '{}');
                  setStatusText('Updating your trip parameters...');
                  // Switch to the most relevant tab after modification
@@ -235,6 +248,7 @@ export function CopilotSheet() {
                    setTimeout(() => window.dispatchEvent(new CustomEvent('switch-tab', { detail: 'hotels' })), 800);
                  }
                } else if (tool.function.name === 'edit_itinerary') {
+                 hasNavigatedOrSwitchedRef.current = true;
                  const args = JSON.parse(tool.function.arguments || '{}');
                  setStatusText('Updating your itinerary...');
                  window.dispatchEvent(new CustomEvent('copilot-edit-itinerary', { detail: args }));
