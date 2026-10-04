@@ -11,6 +11,8 @@ export class LlmService {
     const key = this.configService.get<string>('TUFFY_GROQ_API_KEY');
     if (key && key.trim()) {
       this.logger.log('[Tuffy Groq] Groq client initialized for Tuffy Agent (model: openai/gpt-oss-120b)');
+    } else {
+      this.logger.error('[Tuffy Groq] TUFFY_GROQ_API_KEY is not set — Tuffy will fail to respond!');
     }
     this.groq = new Groq({
       apiKey: key,
@@ -22,10 +24,18 @@ export class LlmService {
     systemPrompt: string,
     abortSignal?: AbortSignal,
     reqId?: string,
-  ): Promise<any> {
+  ): Promise<AsyncIterable<any>> {
+    this.logger.log(`[Tuffy Groq] Starting chat completion stream requestId=${reqId || 'unknown'}`);
+
+    // Guard: if the abort signal is already fired before we even call Groq, bail out now.
+    if (abortSignal?.aborted) {
+      this.logger.warn(`[Tuffy Groq] abortSignal already aborted before Groq call requestId=${reqId || 'unknown'}`);
+      throw Object.assign(new Error('Request aborted'), { name: 'AbortError' });
+    }
+
+    let rawStream: any;
     try {
-      this.logger.log(`[Tuffy Groq] Starting chat completion stream requestId=${reqId || 'unknown'}`);
-      const stream = await this.groq.chat.completions.create(
+      rawStream = await this.groq.chat.completions.create(
         {
           messages: [
             { role: 'system', content: systemPrompt },
@@ -127,17 +137,17 @@ export class LlmService {
               type: 'function',
               function: {
                 name: 'modify_trip',
-                description: 'Modify trip parameters when the user wants to change their origin / starting city, destination, dates (extend, shorten, or move trip dates), budget, companions, or interests. Only include the fields that need to change.',
+                description: 'Plan a new trip or update trip parameters whenever the user requests a trip plan, states travel intentions (destination, origin, dates, budget, companions), or wants to change/extend existing trip parameters.',
                 parameters: {
                   type: 'object',
                   properties: {
-                    origin: { type: 'string', description: 'New departure / starting city or airport (e.g., "Bengaluru", "New York")' },
-                    destination: { type: 'string', description: 'New destination city or country (e.g., "Cusco", "Paris")' },
-                    fromDate: { type: 'string', description: 'New departure/start date (ISO format YYYY-MM-DD or readable date)' },
-                    toDate: { type: 'string', description: 'New return/end date (ISO format YYYY-MM-DD or readable date)' },
-                    budget: { type: 'string', description: 'New budget level (e.g., "budget", "moderate", "luxury")' },
-                    companions: { type: 'string', description: 'Updated travel companions (e.g., "solo", "couple", "family with kids")' },
-                    interests: { type: 'array', items: { type: 'string' }, description: 'Updated list of travel interests' },
+                    origin: { type: 'string', description: 'Departure / starting city or airport (e.g., "Bhubaneswar", "Bengaluru", "New York")' },
+                    destination: { type: 'string', description: 'Destination city or country (e.g., "Singapore", "Cusco", "Paris")' },
+                    fromDate: { type: 'string', description: 'Departure/start date in YYYY-MM-DD format (e.g., "2026-12-22")' },
+                    toDate: { type: 'string', description: 'Return/end date in YYYY-MM-DD format (e.g., "2027-01-02")' },
+                    budget: { type: 'string', description: 'Budget level (e.g., "budget", "moderate", "luxury")' },
+                    companions: { type: 'string', description: 'Travel companions (e.g., "solo", "couple", "family", "friends")' },
+                    interests: { type: 'array', items: { type: 'string' }, description: 'Travel interests or activities' },
                   },
                 },
               },
@@ -150,7 +160,7 @@ export class LlmService {
                 parameters: {
                   type: 'object',
                   properties: {
-                    instruction: { type: 'string', description: 'The user\'s edit instruction (e.g., "add a museum visit on day 2", "make it more relaxed", "swap day 1 and day 3")' },
+                    instruction: { type: 'string', description: "The user's edit instruction (e.g., \"add a museum visit on day 2\", \"make it more relaxed\", \"swap day 1 and day 3\")" },
                     regenerate: { type: 'boolean', description: 'Set to true to fully regenerate the itinerary from scratch' },
                   },
                   required: ['instruction'],
@@ -163,14 +173,40 @@ export class LlmService {
           signal: abortSignal,
         },
       );
-      return stream;
     } catch (error) {
       if (abortSignal?.aborted || (error as any)?.name === 'AbortError' || (error as any)?.name === 'APIUserAbortError') {
-        this.logger.warn(`[Tuffy Groq] Stream aborted for requestId=${reqId || 'unknown'}`);
+        this.logger.warn(`[Tuffy Groq] stream aborted before first chunk requestId=${reqId || 'unknown'}`);
       } else {
-        this.logger.error(`[Tuffy Groq] Error in Groq stream requestId=${reqId || 'unknown'}`, error);
+        this.logger.error(`[Tuffy Groq] error creating Groq stream requestId=${reqId || 'unknown'}`, error);
       }
       throw error;
     }
+
+    // Wrap the raw Groq stream in a diagnostic async generator.
+    // This lets us log: first chunk received, total chunks, and stream completion or error.
+    const logger = this.logger;
+
+    async function* diagnosticStream(): AsyncGenerator<any> {
+      let chunkCount = 0;
+      try {
+        for await (const chunk of rawStream) {
+          if (chunkCount === 0) {
+            logger.log(`[Tuffy Groq] first chunk received requestId=${reqId || 'unknown'}`);
+          }
+          chunkCount++;
+          yield chunk;
+        }
+        logger.log(`[Tuffy Groq] stream completed (${chunkCount} chunks) requestId=${reqId || 'unknown'}`);
+      } catch (err: any) {
+        if (abortSignal?.aborted || err?.name === 'AbortError' || err?.name === 'APIUserAbortError') {
+          logger.warn(`[Tuffy Groq] stream aborted after ${chunkCount} chunks requestId=${reqId || 'unknown'}`);
+        } else {
+          logger.error(`[Tuffy Groq] stream error after ${chunkCount} chunks requestId=${reqId || 'unknown'}`, err);
+        }
+        throw err;
+      }
+    }
+
+    return diagnosticStream();
   }
 }

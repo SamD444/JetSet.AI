@@ -52,12 +52,12 @@ YOUR PERSONA & RESPONSIBILITIES:
 2. Localize all answers based on the user's current active view and draft selections provided in the <untrusted_context>.
 3. When a user asks a vague question (e.g., "What should I do now?"), evaluate their current page state and provide a specific, actionable next step.
 4. If a user wants to view a different section of their trip (Flights, Hotels, Itinerary, Season, Summary), you MUST use the 'switch_tab' tool to change the active tab. Do NOT use 'navigate_to_page' for flights, hotels, or itinerary.
-5. TRIP PARAMETER MODIFICATIONS (CRITICAL):
-If the user asks to change, extend, shorten, or move trip dates (e.g. "Extend my trip to November 22", "Move my trip to Nov 15", "Make the trip Nov 15 to Nov 22"), change the destination (e.g. "Change my destination to Cusco"), change the starting city/origin (e.g. "Change my starting city to Bangalore"), or change budget/companions:
-   - You MUST invoke the 'modify_trip' tool with the updated parameters (origin, destination, fromDate, toDate, budget, companions, interests).
-   - Use standard ISO format YYYY-MM-DD for fromDate and toDate. For example, if current departure is 2026-11-12 and the user says "Extend my trip to November 22", set toDate to "2026-11-22".
-   - Do NOT merely say you will open a tab or tell the user to do it. Always invoke 'modify_trip'.
-   - When dates are extended or destination is changed, the backend automatically updates flights, stays, itinerary, and all dashboard tabs.
+5. TRIP PLANNING & PARAMETER MODIFICATIONS (CRITICAL):
+Whenever the user asks to plan a trip, travel to a destination, states travel details (e.g. "I want to go to Singapore from Bhubaneswar from 22nd dec to 2nd jan, family trip, moderate budget" or "Plan a trip to Tokyo..."), OR asks to change/extend/shorten/move trip dates/origin/destination/budget/companions:
+   - You MUST invoke the 'modify_trip' tool with all extracted parameters (origin, destination, fromDate, toDate, budget, companions, interests).
+   - Normalize all dates to standard ISO format YYYY-MM-DD. For example, "22nd dec" to "2nd jan" is fromDate="2026-12-22" and toDate="2027-01-02"; "22nd feb to 13th march 2027" is fromDate="2027-02-22" and toDate="2027-03-13".
+   - Do NOT merely say you will plan it or output conversational text without tool calls. Always invoke 'modify_trip'.
+   - Invoking 'modify_trip' saves the trip in the database and automatically opens the user's interactive Results Dashboard with Summary, Flights, Stays, When to Go, and Itinerary tabs.
 6. ITINERARY MODIFICATIONS (CRITICAL): If the user asks to edit their itinerary, add an activity/place (e.g. "Add Sydney Opera House to Day 2"), remove an activity, move an item between days, or make a day relaxed/free (e.g. "Make Day 4 a relaxed day", "Include a relaxed day"):
    - You MUST call the 'edit_itinerary' tool with the instruction.
    - Do NOT merely say "I will open your itinerary" or tell the user to do it themselves.
@@ -92,67 +92,70 @@ ${ragContextString}
       throw new HttpException('Rate limit exceeded', HttpStatus.TOO_MANY_REQUESTS);
     }
 
-    const abortController = new AbortController();
-    const timeoutId = setTimeout(() => {
-      this.logger.warn(`[CopilotService] Request ${reqId || ''} timed out after 60s`);
-      abortController.abort();
-    }, 60000); // 60s timeout circuit breaker
+    // Build an internal abort controller that mirrors the client disconnect signal.
+    // NOTE: We intentionally do NOT set a timeout here.
+    // The old 60s timeout was cleared in the 'finally' block before the controller
+    // iterated a single chunk from the returned stream — providing zero protection.
+    // The controller owns the stream iteration and is responsible for any
+    // iteration-level timeout if needed.
+    const internalAbort = new AbortController();
 
     if (clientSignal) {
       if (clientSignal.aborted) {
-        abortController.abort();
+        this.logger.warn(`[CopilotService] clientSignal already aborted on entry requestId=${reqId || 'unknown'}`);
+        internalAbort.abort();
       } else {
         clientSignal.addEventListener('abort', () => {
-          this.logger.log(`[CopilotService] Request ${reqId || ''} aborted by client`);
-          abortController.abort();
+          this.logger.log(`[CopilotService] client disconnected — aborting Groq stream requestId=${reqId || 'unknown'}`);
+          internalAbort.abort();
         }, { once: true });
       }
     }
 
+    this.logger.log(`[CopilotService] handleStream started requestId=${reqId || 'unknown'} user=${userId}`);
+
+    // Extract destination from context if available
+    let destination = '';
+    let userQuery = '';
     try {
-      this.logger.log(`[CopilotService] handleStream started requestId=${reqId || 'unknown'} user=${userId}`);
-      // Extract destination from context if available
-      let destination = '';
-      let userQuery = '';
+      const parsed = JSON.parse(contextData);
+      destination = parsed?.draftSelections?.destination || parsed?.destination || '';
+    } catch {}
+
+    let tripSummary = '';
+    if (tripId) {
       try {
-        const parsed = JSON.parse(contextData);
-        destination = parsed?.draftSelections?.destination || parsed?.destination || '';
+        const trip = await this.tripsService.getTrip(tripId);
+        if (trip) {
+          destination = trip.destination || destination;
+          tripSummary = `\nCURRENT TRIP STATE:\n- Origin: ${trip.origin}\n- Destination: ${trip.destination}\n- Departure Date: ${trip.fromDate}\n- Return Date: ${trip.toDate}\n- Budget: ${trip.budget}\n- Companions: ${trip.companions}\n`;
+        }
       } catch {}
+    }
 
-      let tripSummary = '';
-      if (tripId) {
-        try {
-          const trip = await this.tripsService.getTrip(tripId);
-          if (trip) {
-            destination = trip.destination || destination;
-            tripSummary = `\nCURRENT TRIP STATE:\n- Origin: ${trip.origin}\n- Destination: ${trip.destination}\n- Departure Date: ${trip.fromDate}\n- Return Date: ${trip.toDate}\n- Budget: ${trip.budget}\n- Companions: ${trip.companions}\n`;
-          }
-        } catch {}
-      }
+    // Get the latest user message for RAG query
+    const lastUserMsg = messages.filter(m => m.role === 'user').pop();
+    userQuery = lastUserMsg?.content || '';
 
-      // Get the latest user message for RAG query
-      const lastUserMsg = messages.filter(m => m.role === 'user').pop();
-      userQuery = lastUserMsg?.content || '';
+    const systemPrompt = await this.getSystemPrompt(contextData, destination, userQuery, tripSummary);
 
-      const systemPrompt = await this.getSystemPrompt(contextData, destination, userQuery, tripSummary);
-      
+    this.logger.log(`[CopilotService] system prompt ready, calling Groq requestId=${reqId || 'unknown'}`);
+
+    try {
       const stream = await this.llmService.getChatCompletionStream(
-        messages, 
-        systemPrompt, 
-        abortController.signal,
-        reqId
+        messages,
+        systemPrompt,
+        internalAbort.signal,
+        reqId,
       );
-      
       return stream;
     } catch (error) {
-      if (abortController.signal.aborted || (error as any)?.name === 'AbortError' || (error as any)?.name === 'APIUserAbortError') {
-        this.logger.warn(`[CopilotService] Stream aborted for requestId=${reqId || 'unknown'}`);
+      if (internalAbort.signal.aborted || (error as any)?.name === 'AbortError' || (error as any)?.name === 'APIUserAbortError') {
+        this.logger.warn(`[CopilotService] Groq call aborted requestId=${reqId || 'unknown'}`);
       } else {
-        this.logger.error(`[CopilotService] Error in CopilotService stream requestId=${reqId || 'unknown'}`, error);
+        this.logger.error(`[CopilotService] Groq call failed requestId=${reqId || 'unknown'}`, error);
       }
       throw error;
-    } finally {
-      clearTimeout(timeoutId);
     }
   }
 
@@ -300,7 +303,31 @@ Day 2: [Day Title]
     updates: any,
   ): Promise<{ success: boolean; confirmation: string; updatedTrip?: any; updatedFields: string[] }> {
     if (!tripId) {
-      return { success: false, confirmation: 'Trip ID not found.', updatedFields: [] };
+      try {
+        this.logger.log(`[Tuffy Groq] Creating new trip from Tuffy planning intent: ${JSON.stringify(updates)}`);
+        const newTrip = await this.tripsService.createTrip({
+          origin: updates.origin || '',
+          destination: updates.destination || '',
+          fromDate: updates.fromDate || '',
+          toDate: updates.toDate || '',
+          budget: updates.budget || 'moderate',
+          companions: updates.companions || 'solo',
+          interests: updates.interests || [],
+          currency: updates.currency || 'USD',
+        });
+
+        const confirmation = `I've created your trip plan to ${newTrip.destination || 'your destination'} from ${newTrip.origin || 'your departure city'} (${newTrip.fromDate || ''} to ${newTrip.toDate || ''}). Opening your trip dashboard now!`;
+
+        return {
+          success: true,
+          confirmation,
+          updatedTrip: newTrip,
+          updatedFields: Object.keys(updates),
+        };
+      } catch (err: any) {
+        this.logger.error(`[Tuffy Groq] Failed to create new trip: ${err.message}`);
+        return { success: false, confirmation: `Failed to create trip: ${err.message}`, updatedFields: [] };
+      }
     }
 
     try {

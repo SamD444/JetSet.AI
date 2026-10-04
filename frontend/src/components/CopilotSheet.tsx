@@ -11,7 +11,8 @@ import { Loader2, Plane, Hotel, Map, MapPin, Navigation, Send, CheckSquare } fro
 import { getApiUrl } from '@/utils/api';
 import { JettyMascot } from './assistant/JettyMascot';
 import { useJettyState } from '@/hooks/useJettyState';
-import { useRouter } from 'next/navigation';
+import { useRouter, usePathname } from 'next/navigation';
+import { formatDisplayDates } from '@/lib/dateUtils';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -37,7 +38,7 @@ const getSuggestedQuestions = (route: string, view: string) => {
 };
 
 export function CopilotSheet() {
-  const { isOpen, setIsOpen, messages, addMessage, activeRoute, activeView, draftSelections, setIsStreaming, tripId, documentContext } = useCopilotStore();
+  const { isOpen, setIsOpen, messages, addMessage, activeRoute, activeView, draftSelections, setIsStreaming, tripId, setTripId, documentContext } = useCopilotStore();
   const { jettyState } = useJettyState();
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
@@ -47,6 +48,7 @@ export function CopilotSheet() {
   const activeAbortControllerRef = useRef<AbortController | null>(null);
   const currentRequestIdRef = useRef<string | null>(null);
   const router = useRouter();
+  const pathname = usePathname();
   
   const suggestedQuestions = useMemo(() => getSuggestedQuestions(activeRoute, activeView), [activeRoute, activeView]);
 
@@ -184,9 +186,29 @@ export function CopilotSheet() {
             }
             if (payload.tripUpdated && payload.updatedTrip) {
               setStatusText('Updating your trip...');
+              const updatedTrip = payload.updatedTrip;
+              if (updatedTrip.id) {
+                setTripId(updatedTrip.id);
+              }
               window.dispatchEvent(new CustomEvent('copilot-trip-updated', {
                 detail: payload.updatedTrip
               }));
+
+              // If user is not currently on the results page for this trip, transition to ResultsDashboard!
+              if (updatedTrip.id && (!pathname || !pathname.includes(updatedTrip.id))) {
+                const orgParam = encodeURIComponent(updatedTrip.origin || '');
+                const destParam = encodeURIComponent(updatedTrip.destination || '');
+                const fromDateStr = updatedTrip.fromDate || '';
+                const toDateStr = updatedTrip.toDate || '';
+                const displayDates = formatDisplayDates(fromDateStr, toDateStr) || fromDateStr;
+                const exactDates = fromDateStr ? `${fromDateStr}${toDateStr ? '_' + toDateStr : ''}` : '';
+                const displayDatesParam = encodeURIComponent(displayDates);
+                const datesParam = encodeURIComponent(exactDates);
+                const currParam = (updatedTrip.currency && updatedTrip.currency !== 'USD') ? `&curr=${updatedTrip.currency}` : '';
+
+                const resultsUrl = `/results/${updatedTrip.id}?org=${orgParam}&dest=${destParam}&dates=${datesParam}&displayDates=${displayDatesParam}${currParam}`;
+                router.push(resultsUrl);
+              }
             }
             if (payload.toolCalls && payload.toolCalls.length > 0) {
                const tool = payload.toolCalls[0];

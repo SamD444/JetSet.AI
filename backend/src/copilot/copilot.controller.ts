@@ -49,22 +49,35 @@ export class CopilotController {
     const reqId = (req.headers['x-request-id'] as string) || `req_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const clientAbortController = new AbortController();
 
-    req.on('close', () => {
-      if (!res.writableEnded) {
-        clientAbortController.abort();
-      }
-    });
-
+    // SSE headers must be written before wiring close listeners
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
+    // IMPORTANT: Use res.on('close') NOT req.on('close').
+    // req.on('close') fires as soon as the request body is consumed — which
+    // happens immediately in SSE before any response data is sent, causing the
+    // Groq stream to be aborted every time. res.on('close') fires only when the
+    // actual client socket disconnects (tab closed, navigation away).
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        console.log(`[CopilotController] client disconnected requestId=${reqId}`);
+        clientAbortController.abort();
+      }
+    });
+
+    res.on('finish', () => {
+      console.log(`[CopilotController] response finished requestId=${reqId}`);
+    });
+
+    console.log(`[CopilotController] request connected requestId=${reqId} user=${userId}`);
+
     try {
       const stream = await this.copilotService.handleStream(
-        userId, 
-        messages, 
-        context, 
-        effectiveTripId, 
+        userId,
+        messages,
+        context,
+        effectiveTripId,
         clientAbortController.signal,
         reqId
       );
@@ -72,8 +85,10 @@ export class CopilotController {
       const toolCallMap = new Map<number, { id: string; name: string; arguments: string }>();
       let streamedAnyContent = false;
 
+      console.log(`[CopilotController] stream iteration started requestId=${reqId}`);
       for await (const chunk of stream) {
         const delta = chunk.choices[0]?.delta;
+
         
         const payload: CopilotResponsePayload = {};
         
@@ -135,6 +150,9 @@ export class CopilotController {
             const args = JSON.parse(toolCall.arguments || '{}');
             const result = await this.copilotService.executeTripModify(effectiveTripId, args);
             if (result.success) {
+              if (result.updatedTrip?.id) {
+                effectiveTripId = result.updatedTrip.id;
+              }
               const mutationPayload: CopilotResponsePayload = {
                 tripUpdated: true,
                 updatedTrip: result.updatedTrip || args,
@@ -179,70 +197,124 @@ export class CopilotController {
         }
       }
 
-      // If the model did not generate an explicit tool call but user prompt has trip modification intent
+      // If the model did not generate an explicit tool call but user prompt has trip planning / modification intent
       const hasModifyToolCall = Array.from(toolCallMap.values()).some(tc => tc.name === 'modify_trip');
-      if (!hasModifyToolCall && effectiveTripId) {
+      if (!hasModifyToolCall && lastUserMsg) {
         let detectedModifications: any = null;
+        const lowerMsg = lastUserMsg.toLowerCase();
 
-        // Destination change
+        // 1. Destination extraction
         const destMatch =
-          lastUserMsg.match(/(?:change|update|switch|set)\s+(?:my\s+)?destination\s+to\s+([a-zA-Z\s]+?)(?:\s+and\s+update|\.|$)/i) ||
-          lastUserMsg.match(/destination\s+to\s+([a-zA-Z\s]+?)(?:\s+and\s+update|\.|$)/i);
+          lastUserMsg.match(/(?:go\s+to|trip\s+to|visit|heading\s+to|travel\s+to|destination\s+(?:is|to|:))\s+([a-zA-Z\s]+?)(?:\s+(?:from|for|with|dates?|on|in|\d|\.|$|,))/i) ||
+          lastUserMsg.match(/(?:change|update|switch|set)\s+(?:my\s+)?destination\s+to\s+([a-zA-Z\s]+?)(?:\s+and\s+update|\.|$|,)/i) ||
+          lastUserMsg.match(/destination\s+to\s+([a-zA-Z\s]+?)(?:\s+and\s+update|\.|$|,)/i);
         if (destMatch && destMatch[1]) {
           detectedModifications = detectedModifications || {};
           detectedModifications.destination = destMatch[1].trim();
         }
 
-        // Origin change
-        const fromToMatch = lastUserMsg.match(/from\s+([a-zA-Z\s]+?)\s+to\s+([a-zA-Z\s]+?)(?:\s+and\s+destination\s+to\s+([a-zA-Z\s]+))?(?:\.|$)/i);
+        // 2. Origin extraction
+        const fromToMatch = lastUserMsg.match(/from\s+([a-zA-Z\s]+?)\s+to\s+([a-zA-Z\s]+?)(?:\s+and\s+destination\s+to\s+([a-zA-Z\s]+))?(?:\.|$|,)/i);
         if (fromToMatch) {
           detectedModifications = detectedModifications || {};
           detectedModifications.origin = fromToMatch[1].trim();
           if (fromToMatch[3]) {
             detectedModifications.destination = fromToMatch[3].trim();
-          } else if (!detectedModifications.destination) {
+          } else if (!detectedModifications.destination && fromToMatch[2]) {
             detectedModifications.destination = fromToMatch[2].trim();
           }
         } else {
-          const orgMatch = lastUserMsg.match(
-            /(?:change|update|switch|set)\s+(?:my\s+)?(?:starting\s+city|origin|departure\s+city|starting\s+location)\s+to\s+([a-zA-Z\s]+?)(?:\.|$)/i,
-          );
+          const orgMatch =
+            lastUserMsg.match(/(?:from|departing\s+from|starting\s+(?:from|city|location|at|in)|origin\s+(?:is|to|:))\s+([a-zA-Z\s]+?)(?:\s+(?:to|for|with|dates?|on|in|\d|\.|$|,))/i) ||
+            lastUserMsg.match(/(?:change|update|switch|set)\s+(?:my\s+)?(?:starting\s+city|origin|departure\s+city|starting\s+location)\s+to\s+([a-zA-Z\s]+?)(?:\.|$|,)/i);
           if (orgMatch && orgMatch[1]) {
             detectedModifications = detectedModifications || {};
             detectedModifications.origin = orgMatch[1].trim();
           }
         }
 
-        // Date extension / changes
+        // Helper for date normalization
+        const parseNormalizedDate = (raw: string, defaultYear: number = new Date().getFullYear()): string => {
+          if (!raw) return '';
+          const clean = raw.replace(/(st|nd|rd|th)/gi, '').trim();
+          if (/^\d{4}-\d{2}-\d{2}$/.test(clean)) return clean;
+          const monthMap: Record<string, number> = {
+            jan: 1, january: 1, feb: 2, february: 2, mar: 3, march: 3, apr: 4, april: 4,
+            may: 5, jun: 6, june: 6, jul: 7, july: 7, aug: 8, august: 8, sep: 9, september: 9,
+            oct: 10, october: 10, nov: 11, november: 11, dec: 12, december: 12
+          };
+          const parts = clean.split(/\s+/);
+          let day = 1;
+          let month = 1;
+          let year = defaultYear;
+          for (const p of parts) {
+            const num = parseInt(p, 10);
+            const low = p.toLowerCase();
+            if (monthMap[low]) {
+              month = monthMap[low];
+            } else if (!isNaN(num)) {
+              if (num > 1000) year = num;
+              else day = num;
+            }
+          }
+          const mm = String(month).padStart(2, '0');
+          const dd = String(day).padStart(2, '0');
+          return `${year}-${mm}-${dd}`;
+        };
+
+        // 3. Dates extraction
+        const rangeMatch =
+          lastUserMsg.match(/(?:from\s+|dates?\s+(?:are\s+|:\s*)?)?(\d{1,2}(?:st|nd|rd|th)?\s+[a-zA-Z]+|[a-zA-Z]+\s+\d{1,2}(?:st|nd|rd|th)?|\d{4}-\d{2}-\d{2})\s+to\s+(\d{1,2}(?:st|nd|rd|th)?\s+[a-zA-Z]+(?:\s+\d{4})?|[a-zA-Z]+\s+\d{1,2}(?:st|nd|rd|th)?(?:\s+\d{4})?|\d{4}-\d{2}-\d{2})/i) ||
+          lastUserMsg.match(/(?:make|change|set)\s+(?:the\s+trip\s+)?([a-zA-Z]+\s+\d{1,2})\s+to\s+([a-zA-Z]+\s+\d{1,2}(?:,\s*\d{4})?|\d{4}-\d{2}-\d{2})/i);
+        
+        if (rangeMatch && rangeMatch[1] && rangeMatch[2]) {
+          detectedModifications = detectedModifications || {};
+          const currentYear = new Date().getFullYear();
+          const from = parseNormalizedDate(rangeMatch[1].trim(), currentYear);
+          let toYear = currentYear;
+          // Check if toDate crosses into next year
+          if (from) {
+            const fromMonth = parseInt(from.split('-')[1], 10);
+            const toMonthCheck = rangeMatch[2].toLowerCase();
+            if (fromMonth >= 11 && (toMonthCheck.includes('jan') || toMonthCheck.includes('feb'))) {
+              toYear = currentYear + 1;
+            }
+          }
+          const to = parseNormalizedDate(rangeMatch[2].trim(), toYear);
+          detectedModifications.fromDate = from;
+          detectedModifications.toDate = to;
+        }
+
+        // Extend single date
         const extendMatch = lastUserMsg.match(
           /extend\s+(?:my\s+trip\s+)?(?:from\s+[a-zA-Z0-9,\s]+\s+)?to\s+([a-zA-Z]+\s+\d{1,2}(?:,\s*\d{4})?|\d{4}-\d{2}-\d{2})/i,
         );
         if (extendMatch && extendMatch[1]) {
           detectedModifications = detectedModifications || {};
-          detectedModifications.toDate = extendMatch[1].trim();
+          detectedModifications.toDate = parseNormalizedDate(extendMatch[1].trim());
         }
 
-        const rangeMatch = lastUserMsg.match(
-          /(?:make|change|set)\s+(?:the\s+trip\s+)?([a-zA-Z]+\s+\d{1,2})\s+to\s+([a-zA-Z]+\s+\d{1,2}(?:,\s*\d{4})?|\d{4}-\d{2}-\d{2})/i,
-        );
-        if (rangeMatch && rangeMatch[1] && rangeMatch[2]) {
+        // 4. Budget extraction
+        const budgetMatch = lowerMsg.match(/\b(moderate|budget|luxury|cheap|expensive|mid-range)\b/);
+        if (budgetMatch) {
           detectedModifications = detectedModifications || {};
-          detectedModifications.fromDate = rangeMatch[1].trim();
-          detectedModifications.toDate = rangeMatch[2].trim();
+          detectedModifications.budget = budgetMatch[1] === 'cheap' ? 'budget' : budgetMatch[1] === 'mid-range' ? 'moderate' : budgetMatch[1];
         }
 
-        const moveMatch = lastUserMsg.match(
-          /move\s+(?:my\s+trip\s+)?to\s+([a-zA-Z]+\s+\d{1,2}(?:,\s*\d{4})?|\d{4}-\d{2}-\d{2})/i,
-        );
-        if (moveMatch && moveMatch[1] && !detectedModifications?.toDate) {
+        // 5. Companions extraction
+        const compMatch = lowerMsg.match(/\b(family|solo|couple|friends|group)\b/);
+        if (compMatch) {
           detectedModifications = detectedModifications || {};
-          detectedModifications.fromDate = moveMatch[1].trim();
+          detectedModifications.companions = compMatch[1];
         }
 
         if (detectedModifications && Object.keys(detectedModifications).length > 0) {
           try {
             const result = await this.copilotService.executeTripModify(effectiveTripId, detectedModifications);
             if (result.success) {
+              if (result.updatedTrip?.id) {
+                effectiveTripId = result.updatedTrip.id;
+              }
               res.write(
                 `data: ${JSON.stringify({
                   toolCalls: [

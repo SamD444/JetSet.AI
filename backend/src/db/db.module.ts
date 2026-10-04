@@ -118,10 +118,14 @@ function createInMemoryPool() {
         const pool = new pg.Pool({
           connectionString: dbUrl,
           ssl: isLocalhost ? false : { rejectUnauthorized: false },
+          // Allow up to 15 seconds for first connection to Supabase pooler.
+          // Without this, the pg default can fail on slow network paths (e.g. remote pooler).
+          connectionTimeoutMillis: 15000,
         });
 
         // Test the connection — fall back to in-memory if it fails
         try {
+          new Logger('DbModule').log('Connecting to PostgreSQL/Supabase (timeout: 15s)...');
           const client = await pool.connect();
           client.release();
           new Logger('DbModule').log('Connected to PostgreSQL database');
