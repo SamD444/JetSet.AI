@@ -16,6 +16,7 @@ interface TransitOption {
 
 interface RuralStay {
   id: number;
+  osm_id?: number | string;
   name: string;
   lat: number;
   lon: number;

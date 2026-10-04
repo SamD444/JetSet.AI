@@ -211,13 +211,7 @@ export default function ResultsDashboard({ tripId, org, dest, dates, displayDate
         }, 3000);
     }, []);
 
-    useEffect(() => {
-        // Pre-fetch all other tabs in the background 100ms after initial mount
-        const timer = setTimeout(() => {
-            setVisitedTabs(["summary", "flights", "hotels", "season", "itinerary", "transit"]);
-        }, 100);
-        return () => clearTimeout(timer);
-    }, []);
+
 
     useEffect(() => {
         const handleSwitchTab = (e: Event) => {
