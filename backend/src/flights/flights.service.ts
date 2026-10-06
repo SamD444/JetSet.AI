@@ -301,12 +301,24 @@ export class FlightsService {
         const legs: any[] = entry.flights || [];
         const bookingToken: string = entry.booking_token || '';
         const totalDurationMin: number = entry.total_duration || 0;
+        // Price from SerpAPI
+        const priceRaw: number | null = entry.price ?? null;
+        const price = priceRaw !== null ? {
+            currency,
+            total: priceRaw.toString(),
+        } : {
+            currency,
+            total: null,
+        };
 
         // Build segment list from each leg
         const segments = legs.map((leg: any) => {
             const carrierCode = this.extractCarrierCode(leg.airline_logo || '', leg.flight_number || '');
             const airlineName: string = leg.airline || '';
             const flightNumber: string = leg.flight_number || '';
+
+            // Associate real fare: if explicit leg price exists, or for single-segment flight use priceRaw
+            const legFare = leg.price ?? leg.ticket_price ?? leg.fare ?? (legs.length === 1 && priceRaw !== null ? priceRaw : null);
 
             return {
                 departure: {
@@ -329,7 +341,7 @@ export class FlightsService {
                 legroom: leg.legroom || '',
                 overnight: leg.overnight || false,
                 carbonEmissions: leg.carbon_emissions?.this_flight || null,
-                price: leg.price ?? leg.ticket_price ?? leg.fare ?? null,
+                price: legFare,
             };
         });
 
@@ -345,16 +357,6 @@ export class FlightsService {
 
         // Calculate layover info
         const layovers: any[] = entry.layovers || [];
-
-        // Price from SerpAPI
-        const priceRaw: number | null = entry.price ?? null;
-        const price = priceRaw !== null ? {
-            currency,
-            total: priceRaw.toString(),
-        } : {
-            currency,
-            total: null,
-        };
 
         // Build Google Flights redirect URL using booking_token (for step 2 if needed)
         // SerpAPI also provides a direct Google Flights deep-link in some cases
