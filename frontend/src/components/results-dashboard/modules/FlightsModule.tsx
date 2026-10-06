@@ -180,10 +180,20 @@ function normalizeSingleFlightToJourney(
     const rawSegments = itinerary?.segments || [];
     const rawLayovers = itinerary?.layovers || [];
 
+    const priceVal = parseFloat(flight.price?.total || "0");
+    const currency = currencyOverride || flight.price?.currency || flight.price?.curr || "USD";
+    const hasSingleSegment = rawSegments.length === 1;
+
     const segments: CompleteSegment[] = rawSegments.map((s: any) => {
         const carrier = s.carrierCode || "AI";
         const fromIata = s.departure?.iataCode || group.originIata;
         const toIata = s.arrival?.iataCode || group.destinationIata;
+
+        // Preserve real segment price if available on segment, or from single-segment leg search
+        const segPrice = s.price !== undefined && s.price !== null
+            ? (typeof s.price === "number" ? s.price : parseFloat(s.price))
+            : (hasSingleSegment && !isNaN(priceVal) && priceVal > 0 ? priceVal : null);
+
         return {
             from: IATA_CITY_MAP[fromIata] || s.departure?.name || group.origin,
             fromIata,
@@ -198,7 +208,7 @@ function normalizeSingleFlightToJourney(
             airplane: s.airplane,
             travelClass: s.travelClass,
             legroom: s.legroom,
-            price: null,
+            price: segPrice,
         };
     });
 
@@ -226,9 +236,6 @@ function normalizeSingleFlightToJourney(
         const laySum = layovers.reduce((sum, l) => sum + l.durationMinutes, 0);
         durationMins = segSum + laySum;
     }
-
-    const priceVal = parseFloat(flight.price?.total || "0");
-    const currency = currencyOverride || flight.price?.currency || flight.price?.curr || "USD";
 
     // Stop count = segments.length - 1
     const stopCount = Math.max(0, segments.length - 1);
