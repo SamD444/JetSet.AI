@@ -168,6 +168,16 @@ const MAP_TO_AIRLINE: Record<string, string> = {
 const AIRLINE_LOGO_URL = (code: string) =>
     `https://www.gstatic.com/flights/airline_logos/70px/${code}.png`;
 
+// Robust number parser that strips commas, currency signs, and non-numeric chars
+function parsePrice(val: any): number | null {
+    if (val === null || val === undefined) return null;
+    if (typeof val === "number") return isNaN(val) ? null : val;
+    const cleaned = String(val).replace(/[^0-9.-]/g, "");
+    if (!cleaned) return null;
+    const num = parseFloat(cleaned);
+    return isNaN(num) ? null : num;
+}
+
 // --- Normalization: Convert raw flights into Complete Journey objects ---
 
 function normalizeSingleFlightToJourney(
@@ -180,7 +190,16 @@ function normalizeSingleFlightToJourney(
     const rawSegments = itinerary?.segments || [];
     const rawLayovers = itinerary?.layovers || [];
 
-    const priceVal = parseFloat(flight.price?.total || "0");
+    const rawFlightPrice =
+        flight.price?.total ??
+        flight.price?.raw ??
+        flight.price?.amount ??
+        flight.price?.value ??
+        flight.totalPrice ??
+        flight.fare ??
+        flight.price ??
+        null;
+    const priceVal = parsePrice(rawFlightPrice) || 0;
     const currency = currencyOverride || flight.price?.currency || flight.price?.curr || "USD";
     const hasSingleSegment = rawSegments.length === 1;
 
@@ -190,9 +209,11 @@ function normalizeSingleFlightToJourney(
         const toIata = s.arrival?.iataCode || group.destinationIata;
 
         // Preserve real segment price if available on segment, or from single-segment leg search
-        const segPrice = s.price !== undefined && s.price !== null
-            ? (typeof s.price === "number" ? s.price : parseFloat(s.price))
-            : (hasSingleSegment && !isNaN(priceVal) && priceVal > 0 ? priceVal : null);
+        const rawSegPrice = s.price ?? s.ticketPrice ?? s.fare ?? s.ticket_price ?? s.rate;
+        const parsedSeg = parsePrice(rawSegPrice);
+        const segPrice = parsedSeg !== null && parsedSeg > 0
+            ? parsedSeg
+            : (hasSingleSegment && priceVal > 0 ? priceVal : null);
 
         return {
             from: IATA_CITY_MAP[fromIata] || s.departure?.name || group.origin,
@@ -641,8 +662,10 @@ function CompleteJourneyCard({
                                         {/* Segment Price Information */}
                                         <div className="flex items-center justify-between text-[11px] text-white/50 pt-1 border-t border-white/5">
                                             <span>Segment fare:</span>
-                                            <span className="text-white/70 font-medium">
-                                                {seg.price ? `${journey.currency} ${seg.price.toLocaleString()}` : "Included in total journey price"}
+                                            <span className="text-white/80 font-semibold">
+                                                {seg.price !== null && seg.price !== undefined && !isNaN(Number(seg.price)) && Number(seg.price) > 0
+                                                    ? `${journey.currency} ${Number(seg.price).toLocaleString()}`
+                                                    : "Included in total journey price"}
                                             </span>
                                         </div>
                                     </div>
