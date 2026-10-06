@@ -7,6 +7,7 @@ import { RagService } from '../rag/rag.service';
 import { normalizeAndHash } from '../common/normalize';
 import { OpenRouterService, OpenRouterMessage } from '../openrouter/openrouter.service';
 import { GoogleGenAI } from '@google/genai';
+import { calculateCalendarDays, adaptItineraryForDates } from '../common/itinerary-date.utils';
 // @ts-ignore
 import { MultiFormatReader, RGBLuminanceSource, BinaryBitmap, HybridBinarizer } from '@zxing/library';
 export interface ItineraryStopDto {
@@ -953,12 +954,20 @@ Return ONLY a JSON object with this exact structure:
     return combined.substring(startIdx + startTag.length, endIdx).trim();
   }
 
+  adaptItineraryDays(
+    existingItin: string,
+    destination: string,
+    oldFrom: string,
+    oldTo: string,
+    newFrom: string,
+    newTo: string,
+  ): string {
+    return adaptItineraryForDates(existingItin, destination, oldFrom, oldTo, newFrom, newTo);
+  }
+
   private async callCombinedPlanGenerationStream(trip: any, context: string, onChunk: (text: string) => void): Promise<string> {
-    const from = new Date(trip.fromDate);
-    const to = new Date(trip.toDate);
-    const validDates = !isNaN(from.getTime()) && !isNaN(to.getTime());
-    const nights = validDates ? Math.max(1, Math.round((to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24))) : 5;
-    const days = nights + 1;
+    const days = calculateCalendarDays(trip.fromDate, trip.toDate);
+    const nights = Math.max(1, days - 1);
     const currency = trip.currency || 'USD';
 
     const prompt = `You are JetSet.AI, a premium travel companion. Generate a comprehensive travel plan for a trip to ${trip.destination}.
@@ -1033,7 +1042,9 @@ Format strictly as a markdown table with 3 columns:
 ---SUMMARY_END---
 
 ---ITINERARY_START---
-Generate a detailed day-by-day travel itinerary for ${days} days (from ${trip.fromDate} to ${trip.toDate}). Use the format:
+Generate a detailed day-by-day travel itinerary for EXACTLY ${days} days (from ${trip.fromDate} to ${trip.toDate}).
+You MUST output all ${days} days from Day 1 to Day ${days} without skipping or omitting any days.
+Use the format:
 Day 1: Arrival & Exploration
 - Activity or tip
 - Activity or tip
@@ -1042,7 +1053,7 @@ Day 2: ...
 - ...
 Day ${days}: Departure & Wrap-up
 - Activity or tip
----ITINERARY_END`;
+---ITINERARY_END---`;
 
     let fullResponse = '';
     const wrapper = (chunk: string) => { fullResponse += chunk; onChunk(chunk); };

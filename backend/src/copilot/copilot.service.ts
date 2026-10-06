@@ -7,6 +7,16 @@ import { AiService } from '../ai/ai.service';
 import * as jwt from 'jsonwebtoken';
 import { ConfigService } from '@nestjs/config';
 import { CopilotMessage, ToolCall } from './copilot.types';
+import {
+  calculateCalendarDays,
+  getDateForDay,
+  formatDayDateDisplay,
+  findTargetDayFromInstruction,
+  parseItineraryDays,
+  formatItinerary,
+  validateItinerary,
+  generateDefaultItinerary,
+} from '../common/itinerary-date.utils';
 
 @Injectable()
 export class CopilotService {
@@ -184,56 +194,64 @@ ${ragContextString}
         return { success: false, confirmation: 'Trip not found in database.' };
       }
 
+      const fromDate = trip.fromDate || '2026-12-24';
+      const toDate = trip.toDate || '2027-01-07';
+      const durationDays = calculateCalendarDays(fromDate, toDate);
+
       let currentItinerary = '';
       if (trip.combinedPlan) {
         currentItinerary = (this.aiService as any).extractSection(trip.combinedPlan, 'itinerary') || '';
       }
 
-      if (!currentItinerary || currentItinerary.trim().length === 0) {
-        currentItinerary = `Day 1: Arrival & Exploration
-- Arrive at destination and transfer to accommodation
-- Check-in, freshen up, and take a stroll around the local neighborhood
-- Welcome dinner at a popular local restaurant
+      // If current itinerary is missing or invalid, generate a default template matching durationDays
+      const existingVal = validateItinerary(currentItinerary, fromDate, toDate);
+      if (!existingVal.valid || !currentItinerary.includes('Day 1')) {
+        currentItinerary = generateDefaultItinerary(trip.destination, fromDate, toDate);
+      }
 
-Day 2: Iconic Landmarks & Sights
-- Morning sightseeing tour of primary city landmarks
-- Lunch at a recommended cafe
-- Afternoon museum or cultural experience
-- Scenic evening walk and local dining
+      // Resolve target day from instruction or hint
+      const resolvedTargetDay = dayHint || findTargetDayFromInstruction(instruction, fromDate, toDate);
+      let targetDateInfo = '';
+      if (resolvedTargetDay && resolvedTargetDay >= 1 && resolvedTargetDay <= durationDays) {
+        const targetDateYmd = getDateForDay(fromDate, resolvedTargetDay);
+        const targetDisplay = formatDayDateDisplay(targetDateYmd);
+        targetDateInfo = `TARGET DAY: Day ${resolvedTargetDay} (${targetDateYmd}, ${targetDisplay})`;
+      }
 
-Day 3: Cultural Immersion & Highlights
-- Visit renowned local historical and cultural sites
-- Explore public markets and artisan stalls
-- Sunset viewpoint and relaxing evening
-
-Day 4: Leisure & Free Time
-- Leisurely morning at your own pace
-- Optional local excursions or shopping
-- Dinner at an authentic regional eatery
-
-Day 5: Departure
-- Final breakfast and souvenir shopping
-- Check-out and transfer to airport for departure`;
+      // Build day schedule context
+      const scheduleLines: string[] = [];
+      for (let i = 1; i <= durationDays; i++) {
+        const dYmd = getDateForDay(fromDate, i);
+        const dDisp = formatDayDateDisplay(dYmd);
+        scheduleLines.push(`Day ${i}: ${dYmd} (${dDisp})`);
       }
 
       const prompt = `You are JetSet.AI's itinerary modification engine.
 Modify the following travel itinerary strictly following the user's request.
+
+DESTINATION: ${trip.destination}
+TOTAL TRIP DURATION: ${durationDays} Days (From ${fromDate} to ${toDate})
+
+CANONICAL DAY-TO-DATE SCHEDULE:
+${scheduleLines.join('\n')}
 
 CURRENT ITINERARY:
 ${currentItinerary}
 
 USER MODIFICATION REQUEST:
 "${instruction}"
-${dayHint ? `TARGET DAY: Day ${dayHint}` : ''}
+${targetDateInfo}
 
 STRICT INSTRUCTIONS:
 1. Apply the user's modification accurately:
-   - If adding an activity/place (e.g. "Add Sydney Opera House to Day 2"): add it as an engaging bullet point under the requested day.
-   - If removing an activity (e.g. "Remove this activity"): remove that specific bullet point from the relevant day.
-   - If making a day relaxed or free (e.g. "Make Day 4 a relaxed day" or "include a relaxed day"): update that day's title (e.g. "Day X: Relaxed Leisure & Wellness") and replace its activities with calm leisure activities (e.g. late breakfast, spa/pool time, relaxed sunset stroll, dining at leisure).
-   - If moving an activity (e.g. "Move activity from Day 2 to Day 3"): remove it from Day 2 and add it to Day 3.
-2. Keep ALL OTHER DAYS and activities intact.
-3. Preserve the exact standard format:
+   - If adding an activity/place: add it as an engaging bullet point under the requested day.
+   - If removing an activity: remove that specific bullet point from the relevant day.
+   - If making a day relaxed or free: update that day's title (e.g. "Day X: Relaxed Leisure & Wellness") and replace its activities with calm leisure activities.
+   - If moving an activity: remove it from the source day and add it to the destination day.
+   - If a specific date is mentioned (e.g. Dec 31), modify the corresponding day in the schedule (Day 8 for Dec 31).
+2. The final itinerary MUST contain ALL ${durationDays} days from Day 1 to Day ${durationDays}.
+3. Keep ALL OTHER DAYS and activities intact unless full regeneration is requested.
+4. Preserve the exact standard format:
 Day 1: [Day Title]
 - Activity 1
 - Activity 2
@@ -241,7 +259,10 @@ Day 1: [Day Title]
 Day 2: [Day Title]
 - Activity 1
 ...
-4. Output ONLY the complete revised itinerary starting with "Day 1:" to the final day. Do NOT output code fences (\`\`\`), markdown labels, or conversational chatter.`;
+Day ${durationDays}: [Day Title]
+- Activity 1
+
+5. Output ONLY the complete revised itinerary starting with "Day 1:" to "Day ${durationDays}:". Do NOT output code fences (\`\`\`), markdown labels, or conversational chatter.`;
 
       const updatedRaw = await (this.aiService as any).callModelWithFallback(
         prompt,
@@ -249,11 +270,33 @@ Day 2: [Day Title]
         false,
       );
 
-      const updatedItinerary = updatedRaw.replace(/```[a-z]*\n?/gi, '').replace(/```/g, '').trim();
+      const cleanedRaw = updatedRaw.replace(/```[a-z]*\n?/gi, '').replace(/```/g, '').trim();
 
-      if (!updatedItinerary.includes('Day 1')) {
-        this.logger.warn('[Internal Groq] AI returned invalid itinerary format. Keeping previous itinerary.');
-        return { success: false, confirmation: 'Could not apply itinerary modification cleanly.' };
+      // Check validation
+      let finalItinerary = cleanedRaw;
+      let valResult = validateItinerary(finalItinerary, fromDate, toDate);
+
+      // If AI returned fewer days but cleanly modified the targeted day, merge into existing
+      if (!valResult.valid && resolvedTargetDay && resolvedTargetDay >= 1 && resolvedTargetDay <= durationDays) {
+        const returnedDays = parseItineraryDays(cleanedRaw);
+        const targetReturned = returnedDays.find(d => d.day === resolvedTargetDay) || returnedDays[0];
+        if (targetReturned && targetReturned.activities && targetReturned.activities.length > 0) {
+          const currentDays = parseItineraryDays(currentItinerary);
+          if (currentDays.length === durationDays) {
+            currentDays[resolvedTargetDay - 1] = {
+              day: resolvedTargetDay,
+              title: targetReturned.title || currentDays[resolvedTargetDay - 1].title,
+              activities: targetReturned.activities,
+            };
+            finalItinerary = formatItinerary(currentDays);
+            valResult = validateItinerary(finalItinerary, fromDate, toDate);
+          }
+        }
+      }
+
+      if (!valResult.valid) {
+        this.logger.warn(`[Internal Groq] AI returned invalid itinerary for trip ${tripId}: ${valResult.errors.join(', ')}. Keeping previous valid itinerary.`);
+        return { success: false, confirmation: 'Could not apply itinerary modification cleanly while preserving trip date structure.' };
       }
 
       // Update trip in database
@@ -261,24 +304,34 @@ Day 2: [Day Title]
       if (newCombinedPlan.includes('---ITINERARY_START---') && newCombinedPlan.includes('---ITINERARY_END---')) {
         newCombinedPlan = newCombinedPlan.replace(
           /---ITINERARY_START---[\s\S]*?---ITINERARY_END---/,
-          `---ITINERARY_START---\n${updatedItinerary}\n---ITINERARY_END---`
+          `---ITINERARY_START---\n${finalItinerary}\n---ITINERARY_END---`
         );
       } else {
-        newCombinedPlan = `---SUMMARY_START---\nTrip to ${trip.destination}\n---SUMMARY_END---\n\n---ITINERARY_START---\n${updatedItinerary}\n---ITINERARY_END---`;
+        newCombinedPlan = `---SUMMARY_START---\nTrip to ${trip.destination}\n---SUMMARY_END---\n\n---ITINERARY_START---\n${finalItinerary}\n---ITINERARY_END---`;
       }
 
       await this.tripsService.updateTrip(tripId, { combinedPlan: newCombinedPlan });
-      this.logger.log(`[Deterministic] Successfully updated and persisted itinerary for trip ${tripId}`);
+      this.logger.log(`[Deterministic] Successfully updated and persisted itinerary for trip ${tripId} (${durationDays} days)`);
 
       // Generate a natural, concise confirmation
       let confirmation = `Done — I've updated your itinerary with: "${instruction}".`;
       const lowerInst = instruction.toLowerCase();
-      if (lowerInst.includes('sydney opera house')) {
-        const dayMatch = instruction.match(/day\s*(\d+)/i);
-        confirmation = `Done — I added the Sydney Opera House to Day ${dayMatch ? dayMatch[1] : '2'}.`;
-      } else if (lowerInst.includes('relaxed') || lowerInst.includes('free day')) {
-        const dayMatch = instruction.match(/day\s*(\d+)/i);
-        confirmation = `Done — I've made ${dayMatch ? `Day ${dayMatch[1]}` : 'your requested day'} a relaxed, free day.`;
+      if (resolvedTargetDay) {
+        const targetDateYmd = getDateForDay(fromDate, resolvedTargetDay);
+        const targetDisplay = formatDayDateDisplay(targetDateYmd);
+        if (lowerInst.includes('new year') || lowerInst.includes('celebration')) {
+          confirmation = `Done — I've updated Day ${resolvedTargetDay} (${targetDisplay}) with a grand New Year celebration.`;
+        } else if (lowerInst.includes('relaxed') || lowerInst.includes('free day')) {
+          confirmation = `Done — I've made Day ${resolvedTargetDay} (${targetDisplay}) a relaxed, free day.`;
+        } else if (lowerInst.includes('adventurous') || lowerInst.includes('adventure')) {
+          confirmation = `Done — I've made Day ${resolvedTargetDay} (${targetDisplay}) more adventurous.`;
+        } else if (lowerInst.includes('sydney opera house')) {
+          confirmation = `Done — I added the Sydney Opera House to Day ${resolvedTargetDay} (${targetDisplay}).`;
+        } else {
+          confirmation = `Done — I've updated Day ${resolvedTargetDay} (${targetDisplay}) in your itinerary.`;
+        }
+      } else if (lowerInst.includes('regenerate')) {
+        confirmation = `Done — I've regenerated your complete ${durationDays}-day itinerary.`;
       } else if (lowerInst.includes('remove') || lowerInst.includes('delete')) {
         confirmation = `Done — I've removed that activity from your itinerary.`;
       } else if (lowerInst.includes('move') || lowerInst.includes('swap')) {
@@ -287,7 +340,7 @@ Day 2: [Day Title]
         confirmation = `Done — I've added the requested activity to your itinerary.`;
       }
 
-      return { success: true, updatedItinerary, confirmation };
+      return { success: true, updatedItinerary: finalItinerary, confirmation };
     } catch (err: any) {
       this.logger.error(`[Internal Groq] executeItineraryEdit failed: ${err.message}`);
       return { success: false, confirmation: `Failed to modify itinerary: ${err.message}` };

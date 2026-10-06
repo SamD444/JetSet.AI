@@ -1,6 +1,13 @@
 import { Injectable, NotFoundException, Logger, Inject } from '@nestjs/common';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import type { Cache } from 'cache-manager';
+import {
+  calculateCalendarDays,
+  adaptItineraryForDates,
+  validateItinerary,
+  formatDayDateDisplay,
+  getDateForDay,
+} from '../common/itinerary-date.utils';
 
 export interface TripData {
   id: string;
@@ -238,17 +245,28 @@ export class TripsService {
       // If destination did NOT change, but dates changed, adapt existing itinerary in combinedPlan
       if (!destChanged && current.combinedPlan) {
         try {
-          const oldDays = calculateStayDays(current.fromDate, current.toDate);
-          const newDays = calculateStayDays(newFrom, newTo);
-          if (newDays !== oldDays && aiService) {
-            const currentItin = aiService.extractSection(current.combinedPlan, 'itinerary');
+          const oldDays = calculateCalendarDays(current.fromDate, current.toDate);
+          const newDays = calculateCalendarDays(newFrom, newTo);
+          if (newDays !== oldDays) {
+            const currentItin = aiService ? (aiService as any).extractSection(current.combinedPlan, 'itinerary') : '';
             if (currentItin) {
-              const adaptedItin = await aiService.adaptItineraryDays(currentItin, current.destination, oldDays, newDays);
-              if (adaptedItin) {
+              const adaptedItin = adaptItineraryForDates(
+                currentItin,
+                current.destination,
+                current.fromDate,
+                current.toDate,
+                newFrom,
+                newTo,
+              );
+              const val = validateItinerary(adaptedItin, newFrom, newTo);
+              if (val.valid) {
                 mergedUpdates.combinedPlan = current.combinedPlan.replace(
                   /---ITINERARY_START---[\s\S]*?---ITINERARY_END---/,
                   `---ITINERARY_START---\n${adaptedItin}\n---ITINERARY_END---`
                 );
+                this.logger.log(`[Deterministic] Successfully adapted itinerary for trip ${tripId} from ${oldDays} days to ${newDays} days`);
+              } else {
+                this.logger.warn(`[Deterministic] Adapted itinerary failed validation: ${val.errors.join(', ')}`);
               }
             }
           }

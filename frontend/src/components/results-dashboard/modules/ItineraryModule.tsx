@@ -48,6 +48,28 @@ function parseItinerary(text: string): ItineraryDay[] {
     return days;
 }
 
+function getDayDateString(datesProp: string | undefined, dayNum: number): string {
+    if (!datesProp) return "";
+    const isoMatch = datesProp.match(/(\d{4}-\d{2}-\d{2})/);
+    let startDate: Date | null = null;
+    if (isoMatch) {
+        const parts = isoMatch[1].split("-").map(Number);
+        startDate = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
+    } else {
+        const firstPart = datesProp.split(/to|–|-/)[0].trim();
+        const d = new Date(firstPart);
+        if (!isNaN(d.getTime())) {
+            startDate = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+        }
+    }
+
+    if (!startDate || isNaN(startDate.getTime())) return "";
+
+    const targetDate = new Date(startDate.getTime() + (dayNum - 1) * 24 * 60 * 60 * 1000);
+    const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    return `${months[targetDate.getUTCMonth()]} ${targetDate.getUTCDate()}`;
+}
+
 export default function ItineraryModule({ tripId, org, dest, dates }: ModuleProps) {
     const [itinerary, setItinerary] = useState("");
     const [isLoading, setIsLoading] = useState(true);
@@ -294,7 +316,9 @@ Be specific with landmarks, restaurants, transport tips, and timings. Keep it pr
                                         <span className="text-[10px] font-mono text-cyan-300 font-bold leading-none mt-0.5">{day.day}</span>
                                     </div>
                                     <div>
-                                        <p className="text-[10px] font-mono text-cyan-400/70 uppercase tracking-widest">Day {day.day}</p>
+                                        <p className="text-[10px] font-mono text-cyan-400/70 uppercase tracking-widest">
+                                            Day {day.day}{getDayDateString(dates, day.day) ? ` • ${getDayDateString(dates, day.day)}` : ""}
+                                        </p>
                                         <h3 className="text-white font-semibold font-syne leading-tight">{day.title}</h3>
                                     </div>
                                 </div>
