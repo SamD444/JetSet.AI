@@ -329,6 +329,7 @@ export class FlightsService {
                 legroom: leg.legroom || '',
                 overnight: leg.overnight || false,
                 carbonEmissions: leg.carbon_emissions?.this_flight || null,
+                price: leg.price ?? leg.ticket_price ?? leg.fare ?? null,
             };
         });
 
