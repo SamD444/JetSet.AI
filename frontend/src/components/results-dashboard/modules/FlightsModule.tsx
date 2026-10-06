@@ -5,7 +5,7 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
     ExternalLink, Search, Plane, CalendarDays,
-    Loader2, RefreshCw, ChevronDown, ChevronUp, Clock, Leaf, AlertCircle
+    Loader2, RefreshCw, ChevronDown, ChevronUp, Clock, Leaf
 } from "lucide-react";
 import SkeletonLoader from "../SkeletonLoader";
 import { ModuleProps } from "./types";
@@ -99,6 +99,32 @@ export interface CompleteJourney {
     carbonDiff?: number | null;
 }
 
+// --- Common City Mappings for Clear Airport + City Display ---
+
+const IATA_CITY_MAP: Record<string, string> = {
+    "CCU": "Kolkata", "DEL": "Delhi", "BOM": "Mumbai", "BLR": "Bengaluru",
+    "MAA": "Chennai", "HYD": "Hyderabad", "BBI": "Bhubaneswar", "COK": "Kochi",
+    "AMD": "Ahmedabad", "GOI": "Goa", "GOX": "Goa (Mopa)", "JAI": "Jaipur",
+    "FCO": "Rome", "CIA": "Rome (Ciampino)", "MXP": "Milan", "LIN": "Milan (Linate)",
+    "VCE": "Venice", "AMS": "Amsterdam", "CDG": "Paris", "ORY": "Paris (Orly)",
+    "LHR": "London (Heathrow)", "LGW": "London (Gatwick)", "STN": "London (Stansted)",
+    "FRA": "Frankfurt", "MUC": "Munich", "BER": "Berlin", "ZRH": "Zurich",
+    "VIE": "Vienna", "MAD": "Madrid", "BCN": "Barcelona", "LIS": "Lisbon",
+    "ATH": "Athens", "IST": "Istanbul", "DXB": "Dubai", "AUH": "Abu Dhabi",
+    "DOH": "Doha", "SIN": "Singapore", "BKK": "Bangkok", "DMK": "Bangkok (Don Mueang)",
+    "KUL": "Kuala Lumpur", "HKG": "Hong Kong", "NRT": "Tokyo (Narita)", "HND": "Tokyo (Haneda)",
+    "KIX": "Osaka", "ICN": "Seoul (Incheon)", "SYD": "Sydney", "MEL": "Melbourne",
+    "ADD": "Addis Ababa", "CAI": "Cairo", "JFK": "New York (JFK)", "EWR": "New York (Newark)",
+    "ORD": "Chicago", "SFO": "San Francisco", "LAX": "Los Angeles", "YVR": "Vancouver",
+    "YYZ": "Toronto", "KTM": "Kathmandu", "CMB": "Colombo", "DAC": "Dhaka",
+};
+
+export function formatAirportCity(nameOrCity: string, iata: string): string {
+    const code = (iata || "").toUpperCase();
+    const city = IATA_CITY_MAP[code] || nameOrCity || code;
+    return `${city} (${code})`;
+}
+
 // --- Helpers ---
 
 const fmtDisplay = (iso: string): string => {
@@ -156,11 +182,13 @@ function normalizeSingleFlightToJourney(
 
     const segments: CompleteSegment[] = rawSegments.map((s: any) => {
         const carrier = s.carrierCode || "AI";
+        const fromIata = s.departure?.iataCode || group.originIata;
+        const toIata = s.arrival?.iataCode || group.destinationIata;
         return {
-            from: s.departure?.name || s.departure?.iataCode || group.origin,
-            fromIata: s.departure?.iataCode || group.originIata,
-            to: s.arrival?.name || s.arrival?.iataCode || group.destination,
-            toIata: s.arrival?.iataCode || group.destinationIata,
+            from: IATA_CITY_MAP[fromIata] || s.departure?.name || group.origin,
+            fromIata,
+            to: IATA_CITY_MAP[toIata] || s.arrival?.name || group.destination,
+            toIata,
             departureTime: formatTimeString(s.departure?.at),
             arrivalTime: formatTimeString(s.arrival?.at),
             carrierCode: carrier,
@@ -174,12 +202,15 @@ function normalizeSingleFlightToJourney(
         };
     });
 
-    const layovers: CompleteLayover[] = rawLayovers.map((l: any) => ({
-        airportIata: l.id || "",
-        airportName: l.name || l.id || "Layover",
-        durationMinutes: typeof l.duration === "number" ? l.duration : parseIsoDuration(l.duration || ""),
-        overnight: l.overnight,
-    }));
+    const layovers: CompleteLayover[] = rawLayovers.map((l: any) => {
+        const airportIata = l.id || "";
+        return {
+            airportIata,
+            airportName: IATA_CITY_MAP[airportIata] || l.name || airportIata || "Layover",
+            durationMinutes: typeof l.duration === "number" ? l.duration : parseIsoDuration(l.duration || ""),
+            overnight: l.overnight,
+        };
+    });
 
     const firstSeg = segments[0];
     const lastSeg = segments[segments.length - 1];
@@ -206,9 +237,9 @@ function normalizeSingleFlightToJourney(
     const connections: string[] = [];
     if (segments.length > 1) {
         for (let i = 0; i < segments.length - 1; i++) {
-            const arrName = segments[i].to;
             const arrCode = segments[i].toIata;
-            connections.push(arrName && arrName !== arrCode ? arrName : arrCode);
+            const arrCity = IATA_CITY_MAP[arrCode] || segments[i].to || arrCode;
+            connections.push(arrCity);
         }
     }
 
@@ -275,7 +306,6 @@ function combineMultiLegFlights(
     const list1 = legFlightLists[0];
     const list2 = legFlightLists[1];
 
-    // Combine top options from leg1 and leg2
     const maxCombinations = 15;
     let count = 0;
 
@@ -290,13 +320,13 @@ function combineMultiLegFlights(
 
             const allSegments = [...j1.segments, ...j2.segments];
             const transferAirportIata = legs[0].toIata;
-            const transferAirportName = legs[0].to || transferAirportIata;
+            const transferCity = IATA_CITY_MAP[transferAirportIata] || legs[0].to || transferAirportIata;
 
             // Layover between leg1 and leg2
             const transferLayover: CompleteLayover = {
                 airportIata: transferAirportIata,
-                airportName: transferAirportName,
-                durationMinutes: 120, // Default 2h connection estimate
+                airportName: transferCity,
+                durationMinutes: 120, // Default 2h connection
             };
 
             const allLayovers = [...j1.layovers, transferLayover, ...j2.layovers];
@@ -305,7 +335,7 @@ function combineMultiLegFlights(
 
             // Total stop count is all intermediate segments
             const stopCount = allSegments.length - 1;
-            const connections = [transferAirportName, ...j1.connections, ...j2.connections].filter(
+            const connections = [transferCity, ...j1.connections, ...j2.connections].filter(
                 (v, idx, arr) => arr.indexOf(v) === idx && v !== group.origin && v !== group.destination
             );
 
@@ -314,7 +344,7 @@ function combineMultiLegFlights(
                 ? j1.primaryAirline
                 : `${j1.primaryAirline} / ${j2.primaryAirline}`;
 
-            const avgScore = Math.round(((j1.matchScore || 80) + (j2.matchScore || 80)) / 2);
+            const avgScore = Math.round(((j1.matchScore || 85) + (j2.matchScore || 85)) / 2);
             const bookingUrl = `https://www.google.com/travel/flights/search?q=Flights+from+${group.originIata}+to+${group.destinationIata}+on+${group.date}`;
 
             combined.push({
@@ -338,7 +368,7 @@ function combineMultiLegFlights(
                 layovers: allLayovers,
                 bookingUrl,
                 matchScore: avgScore,
-                matchReason: j1.matchReason || `Connecting via ${transferAirportName}`,
+                matchReason: j1.matchReason || `Connecting route via ${transferCity}`,
             });
             count++;
         }
@@ -388,17 +418,20 @@ function DirectBookingLinks({ orgCode, destCode, travelDate }: { orgCode: string
 function CompleteJourneyCard({
     journey,
     isReturn,
+    isTopRecommended,
 }: {
     journey: CompleteJourney;
     isReturn: boolean;
+    isTopRecommended: boolean;
 }) {
     const [showDetails, setShowDetails] = useState(false);
 
-    const accentColor = isReturn ? "purple" : "sky";
-    const accentText  = isReturn ? "text-purple-300" : "text-sky-300";
-    const accentBg    = isReturn ? "bg-purple-500/10" : "bg-sky-500/10";
-    const accentBorder= isReturn ? "border-purple-500/20" : "border-sky-500/20";
-    const isRecommended = (journey.matchScore ?? 0) >= 90;
+    const accentText   = isReturn ? "text-purple-300" : "text-sky-300";
+    const accentBg     = isReturn ? "bg-purple-500/10" : "bg-sky-500/10";
+    const accentBorder = isReturn ? "border-purple-500/20" : "border-sky-500/20";
+    
+    // AI Recommendation: check explicit score or top recommendation under BEST
+    const isRecommended = isTopRecommended || (journey.matchScore !== undefined && journey.matchScore >= 90);
 
     const stopLabel = journey.stopCount === 0
         ? "Nonstop"
@@ -409,20 +442,31 @@ function CompleteJourneyCard({
     };
 
     return (
-        <div className={`glass-panel rounded-2xl overflow-hidden border transition-all duration-300 ${
+        <div className={`relative glass-panel rounded-2xl overflow-hidden border transition-all duration-300 ${
             isRecommended
                 ? isReturn
-                    ? "border-purple-500/40 shadow-[0_0_20px_rgba(168,85,247,0.15)] bg-purple-500/5"
-                    : "border-sky-500/40 shadow-[0_0_20px_rgba(14,165,233,0.15)] bg-sky-500/5"
+                    ? "border-purple-500/40 shadow-[0_0_20px_rgba(168,85,247,0.15)] bg-purple-500/5 pt-7"
+                    : "border-sky-500/40 shadow-[0_0_20px_rgba(14,165,233,0.15)] bg-sky-500/5 pt-7"
                 : "border-white/10 bg-white/[0.04] hover:bg-white/[0.07]"
         } p-5 space-y-4`}>
             
+            {/* ── AI Recommended Top Banner ── */}
+            {isRecommended && (
+                <div className={`absolute top-0 left-0 ${
+                    isReturn
+                        ? "bg-gradient-to-r from-purple-500 to-indigo-500"
+                        : "bg-gradient-to-r from-sky-500 to-indigo-500"
+                } text-white text-[10px] uppercase font-bold tracking-wider px-3.5 py-1 rounded-br-xl shadow-md z-10`}>
+                    AI Recommended
+                </div>
+            )}
+
             {/* ── Top Header: Badges & Airline ── */}
             <div className="flex items-center justify-between gap-3 flex-wrap">
                 <div className="flex items-center gap-2.5">
                     {/* Airline logo */}
                     {journey.carrierCodes.length > 0 && (
-                        <div className="w-7 h-7 bg-white rounded-full flex items-center justify-center border border-white/20 overflow-hidden shadow-sm shrink-0">
+                        <div className="w-8 h-8 bg-white rounded-full flex items-center justify-center border border-white/20 overflow-hidden shadow-sm shrink-0">
                             <img
                                 src={AIRLINE_LOGO_URL(journey.carrierCodes[0])}
                                 alt={journey.primaryAirline}
@@ -442,23 +486,22 @@ function CompleteJourneyCard({
                 </div>
 
                 <div className="flex items-center gap-2">
-                    {isRecommended && (
-                        <span className="text-[10px] uppercase font-bold tracking-wider px-2.5 py-1 rounded-full bg-gradient-to-r from-sky-500/20 to-indigo-500/20 border border-sky-500/30 text-sky-300 shadow-sm">
-                            AI {journey.matchScore}% Match
+                    {(journey.matchReason || journey.matchScore) && (
+                        <span className="text-[10px] uppercase font-bold tracking-wider px-2.5 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-mono shadow-sm">
+                            AI {journey.matchScore || 95}% Match
                         </span>
                     )}
                 </div>
             </div>
 
             {/* ── Main Route Visual / Timeline (The Complete Journey) ── */}
-            <div className="flex items-center justify-between gap-2 sm:gap-4 py-2 px-3 rounded-xl bg-white/[0.03] border border-white/5">
+            <div className="flex items-center justify-between gap-2 sm:gap-4 py-3 px-4 rounded-xl bg-white/[0.03] border border-white/5">
                 {/* Origin */}
-                <div className="text-left shrink-0 min-w-[75px]">
+                <div className="text-left shrink-0 min-w-[85px]">
                     <p className={`text-lg sm:text-xl font-bold font-mono ${accentText}`}>
                         {journey.departureTime}
                     </p>
-                    <p className="text-xs font-semibold text-white/90">{journey.originIata}</p>
-                    <p className="text-[10px] text-white/40 truncate max-w-[90px]">{journey.origin}</p>
+                    <p className="text-xs font-semibold text-white/90">{formatAirportCity(journey.origin, journey.originIata)}</p>
                 </div>
 
                 {/* Visual Route Line */}
@@ -477,22 +520,30 @@ function CompleteJourneyCard({
                 </div>
 
                 {/* Destination */}
-                <div className="text-right shrink-0 min-w-[75px]">
+                <div className="text-right shrink-0 min-w-[85px]">
                     <p className={`text-lg sm:text-xl font-bold font-mono ${accentText}`}>
                         {journey.arrivalTime}
                     </p>
-                    <p className="text-xs font-semibold text-white/90">{journey.destinationIata}</p>
-                    <p className="text-[10px] text-white/40 truncate max-w-[90px]">{journey.destination}</p>
+                    <p className="text-xs font-semibold text-white/90">{formatAirportCity(journey.destination, journey.destinationIata)}</p>
                 </div>
             </div>
+
+            {/* AI Match Reason (if present) */}
+            {journey.matchReason && (
+                <div className="px-3 py-1.5 rounded-lg bg-emerald-500/5 border border-emerald-500/15 text-[11px] text-emerald-300/90 italic flex items-center gap-1.5">
+                    <span className="font-semibold not-italic">AI Insight:</span> {journey.matchReason}
+                </div>
+            )}
 
             {/* ── Bottom Price & Actions Row ── */}
             <div className="flex items-center justify-between gap-4 pt-2 border-t border-white/10 flex-wrap">
                 <div>
-                    <span className="text-[10px] uppercase font-bold text-white/40 tracking-wider">Total Journey Price</span>
-                    <div className="flex items-baseline gap-1">
+                    <span className="text-[10px] uppercase font-bold text-white/40 tracking-wider">
+                        Total Journey Price ({journey.direction === "return" ? "Return" : "Outbound"})
+                    </span>
+                    <div className="flex items-baseline gap-1 mt-0.5">
                         <span className="text-xs font-bold text-white/70">{journey.currency}</span>
-                        <span className="text-xl font-extrabold text-white">
+                        <span className="text-2xl font-extrabold text-white">
                             {journey.totalPrice > 0 ? journey.totalPrice.toLocaleString() : "Check Live"}
                         </span>
                     </div>
@@ -529,7 +580,7 @@ function CompleteJourneyCard({
                 </div>
             </div>
 
-            {/* ── Expandable Segment Breakdown (Secondary Info) ── */}
+            {/* ── Expandable Segment Breakdown (Secondary Info with Full City Names) ── */}
             <AnimatePresence>
                 {showDetails && (
                     <motion.div
@@ -544,45 +595,57 @@ function CompleteJourneyCard({
                         <div className="space-y-3">
                             {journey.segments.map((seg, sIdx) => (
                                 <React.Fragment key={sIdx}>
-                                    <div className="p-3 rounded-xl bg-white/[0.03] border border-white/5 space-y-2">
+                                    <div className="p-3.5 rounded-xl bg-white/[0.03] border border-white/5 space-y-2.5">
                                         <div className="flex items-center justify-between text-xs">
                                             <div className="flex items-center gap-2">
                                                 <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${accentBg} ${accentText}`}>
                                                     {sIdx + 1}
                                                 </span>
-                                                <span className="font-bold text-white">{seg.airlineName}</span>
-                                                {seg.flightNumber && <span className="font-mono text-white/40 text-[11px]">({seg.flightNumber})</span>}
+                                                <span className="font-bold text-white">Segment {sIdx + 1}: {seg.airlineName}</span>
+                                                {seg.flightNumber && <span className="font-mono text-white/40 text-[11px]">· {seg.flightNumber}</span>}
                                             </div>
-                                            <span className="text-white/50 text-[11px] font-medium">{formatMins(seg.durationMinutes)}</span>
+                                            <span className="text-white/60 text-xs font-medium">{formatMins(seg.durationMinutes)}</span>
                                         </div>
 
-                                        <div className="flex items-center justify-between text-xs font-mono text-white/90 px-2">
-                                            <div>
-                                                <span className="font-bold">{seg.departureTime}</span>
-                                                <span className="text-white/40 ml-1.5">{seg.fromIata}</span>
+                                        {/* Full City + Airport Name Timeline */}
+                                        <div className="flex items-center justify-between text-xs px-2 py-1 bg-white/[0.02] rounded-lg">
+                                            <div className="text-left">
+                                                <p className="font-bold text-white">{seg.departureTime}</p>
+                                                <p className="text-[11px] text-white/70">{formatAirportCity(seg.from, seg.fromIata)}</p>
                                             </div>
-                                            <div className="text-white/30 text-[10px]">──────── ✈ ────────</div>
-                                            <div>
-                                                <span className="font-bold">{seg.arrivalTime}</span>
-                                                <span className="text-white/40 ml-1.5">{seg.toIata}</span>
+                                            <div className="flex flex-col items-center px-2">
+                                                <span className="text-[10px] text-white/40 mb-0.5">{formatMins(seg.durationMinutes)}</span>
+                                                <Plane className="w-3.5 h-3.5 text-white/30" />
+                                            </div>
+                                            <div className="text-right">
+                                                <p className="font-bold text-white">{seg.arrivalTime}</p>
+                                                <p className="text-[11px] text-white/70">{formatAirportCity(seg.to, seg.toIata)}</p>
                                             </div>
                                         </div>
 
                                         {(seg.airplane || seg.travelClass) && (
-                                            <div className="flex items-center gap-2 text-[10px] text-white/40 pt-1">
+                                            <div className="flex items-center gap-2 text-[10px] text-white/40 pt-0.5">
                                                 {seg.airplane && <span>{seg.airplane}</span>}
                                                 {seg.airplane && seg.travelClass && <span>·</span>}
                                                 {seg.travelClass && <span>{seg.travelClass}</span>}
                                             </div>
                                         )}
+
+                                        {/* Segment Price Information */}
+                                        <div className="flex items-center justify-between text-[11px] text-white/50 pt-1 border-t border-white/5">
+                                            <span>Segment fare:</span>
+                                            <span className="text-white/70 font-medium">
+                                                {seg.price ? `${journey.currency} ${seg.price.toLocaleString()}` : "Included in total journey price"}
+                                            </span>
+                                        </div>
                                     </div>
 
                                     {/* Layover banner if not the last segment */}
                                     {journey.layovers[sIdx] && (
-                                        <div className="flex items-center justify-between px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-300 text-xs">
+                                        <div className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-300 text-xs">
                                             <div className="flex items-center gap-2">
                                                 <Clock className="w-3.5 h-3.5 shrink-0" />
-                                                <span>Connection at <strong>{journey.layovers[sIdx].airportName} ({journey.layovers[sIdx].airportIata})</strong></span>
+                                                <span>Connection at <strong>{formatAirportCity(journey.layovers[sIdx].airportName, journey.layovers[sIdx].airportIata)}</strong></span>
                                             </div>
                                             <span className="font-semibold">{formatMins(journey.layovers[sIdx].durationMinutes)} transfer</span>
                                         </div>
@@ -611,6 +674,9 @@ export default function FlightsModule({ tripId, org, dest, dates, curr }: Module
     const pollTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
     const pollCountRef  = useRef(0);
     const MAX_POLL = 15;
+
+    // Outbound vs Return Journey Switcher (defaults to outbound)
+    const [selectedDirection, setSelectedDirection] = useState<"outbound" | "return">("outbound");
 
     const [sortBy,   setSortBy]   = useState<SortOption>("BEST");
     const [maxStops, setMaxStops] = useState<number | null>(null);
@@ -718,9 +784,9 @@ export default function FlightsModule({ tripId, org, dest, dates, curr }: Module
     // --- Loading ---
     if (legsStatus === "idle" || legsStatus === "loading") {
         return (
-            <div className="space-y-8">
+            <div className="space-y-6">
                 <FlightFilters sortBy={sortBy} setSortBy={setSortBy} maxStops={maxStops} setMaxStops={setMaxStops} />
-                <div className="space-y-6">
+                <div className="space-y-4">
                     {[0, 1].map(i => (
                         <div key={i} className="space-y-3">
                             <div className="h-14 w-full rounded-xl bg-white/5 animate-pulse" />
@@ -735,7 +801,7 @@ export default function FlightsModule({ tripId, org, dest, dates, curr }: Module
     // --- Pending ---
     if (legsStatus === "pending") {
         return (
-            <div className="space-y-8">
+            <div className="space-y-6">
                 <FlightFilters sortBy={sortBy} setSortBy={setSortBy} maxStops={maxStops} setMaxStops={setMaxStops} />
                 <div className="glass-panel rounded-2xl p-10 flex flex-col items-center gap-4 border border-white/10">
                     <div className="w-12 h-12 rounded-full bg-sky-500/15 flex items-center justify-center">
@@ -755,7 +821,7 @@ export default function FlightsModule({ tripId, org, dest, dates, curr }: Module
     // --- Error / no data ---
     if (legsStatus === "error" || !legsData || journeyGroups.length === 0) {
         return (
-            <div className="space-y-8">
+            <div className="space-y-6">
                 <FlightFilters sortBy={sortBy} setSortBy={setSortBy} maxStops={maxStops} setMaxStops={setMaxStops} />
                 <div className="glass-panel rounded-2xl p-8 flex flex-col items-center gap-4 border border-red-500/20">
                     <p className="text-white/60 text-sm">No commercial flight routes required or found for this destination.</p>
@@ -768,187 +834,201 @@ export default function FlightsModule({ tripId, org, dest, dates, curr }: Module
         );
     }
 
-    // --- Main Render: Outbound + Return Journey Groups ---
+    // Active selected journey group (defaults to Outbound)
+    const activeGroup = journeyGroups.find(g => g.direction === selectedDirection) || journeyGroups[0];
+    const isReturn = activeGroup.direction === "return";
+
+    // Check loading state across all legs in the active journey
+    const legStateList = activeGroup.legs.map(l => {
+        const k = `${l.legNum}#${l.fromIata}#${l.toIata}#${l.date}`;
+        return legStates[k];
+    });
+    const isGroupLoading = legStateList.some(s => !s || s.isLoading);
+    const hasGroupError  = legStateList.some(s => s && s.error);
+
+    // Build complete journey options from raw legs
+    const allJourneys = combineMultiLegFlights(activeGroup, legStates, finalCurrency);
+
+    // --- JOURNEY-LEVEL FILTERING & SORTING ---
+    // 1. Filter by Stops / Direct
+    let filteredJourneys = [...allJourneys];
+    const isDirectRequested = sortBy === "DIRECT" || maxStops === 0;
+
+    if (isDirectRequested) {
+        filteredJourneys = filteredJourneys.filter(j => j.stopCount === 0);
+    } else if (maxStops !== null) {
+        filteredJourneys = filteredJourneys.filter(j => j.stopCount <= maxStops);
+    }
+
+    // 2. Sort by selected criterion
+    if (sortBy === "CHEAPEST") {
+        filteredJourneys.sort((a, b) => (a.totalPrice || 0) - (b.totalPrice || 0));
+    } else if (sortBy === "FASTEST") {
+        filteredJourneys.sort((a, b) => (a.totalDurationMinutes || 0) - (b.totalDurationMinutes || 0));
+    } else if (sortBy === "DIRECT") {
+        filteredJourneys.sort((a, b) => {
+            if (a.stopCount !== b.stopCount) return a.stopCount - b.stopCount;
+            return (a.totalPrice || 0) - (b.totalPrice || 0);
+        });
+    } else {
+        // BEST: matchScore descending, then heuristic duration + price
+        filteredJourneys.sort((a, b) => {
+            const scoreA = a.matchScore ?? 80;
+            const scoreB = b.matchScore ?? 80;
+            if (scoreA !== scoreB) return scoreB - scoreA;
+            const algA = (a.totalPrice || 0) + (a.totalDurationMinutes || 0) * 0.5;
+            const algB = (b.totalPrice || 0) + (b.totalDurationMinutes || 0) * 0.5;
+            return algA - algB;
+        });
+    }
+
+    const directFilteredOut = isDirectRequested && filteredJourneys.length === 0 && allJourneys.length > 0;
+
     return (
-        <div className="space-y-8">
+        <div className="space-y-6">
+            {/* ── 1. Top Outbound + Return Journey Switcher ── */}
+            {journeyGroups.length > 1 && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full">
+                    {journeyGroups.map((group) => {
+                        const isSelected = selectedDirection === group.direction;
+                        const isRet = group.direction === "return";
+                        return (
+                            <button
+                                key={group.direction}
+                                onClick={() => setSelectedDirection(group.direction)}
+                                className={`p-4 rounded-2xl border text-left transition-all duration-200 cursor-pointer flex items-center justify-between gap-3 ${
+                                    isSelected
+                                        ? isRet
+                                            ? "bg-purple-500/15 border-purple-500/40 shadow-[0_0_20px_rgba(168,85,247,0.2)] text-white"
+                                            : "bg-sky-500/15 border-sky-500/40 shadow-[0_0_20px_rgba(14,165,233,0.2)] text-white"
+                                        : "bg-white/[0.04] border-white/10 hover:bg-white/[0.08] text-white/70 hover:text-white"
+                                }`}
+                            >
+                                <div className="flex items-center gap-3 min-w-0">
+                                    <div className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 ${
+                                        isSelected
+                                            ? isRet ? "bg-purple-500/30 text-purple-300" : "bg-sky-500/30 text-sky-300"
+                                            : "bg-white/10 text-white/50"
+                                    }`}>
+                                        <Plane className={`w-4 h-4 ${isRet ? "-rotate-45" : "rotate-45"}`} />
+                                    </div>
+                                    <div className="min-w-0">
+                                        <div className="flex items-center gap-2">
+                                            <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full border ${
+                                                isSelected
+                                                    ? isRet
+                                                        ? "bg-purple-500/20 border-purple-500/40 text-purple-200"
+                                                        : "bg-sky-500/20 border-sky-500/40 text-sky-200"
+                                                    : "bg-white/5 border-white/10 text-white/50"
+                                            }`}>
+                                                {isRet ? "Return" : "Outbound"}
+                                            </span>
+                                            <span className="text-xs text-white/50 font-medium">{fmtDisplay(group.date)}</span>
+                                        </div>
+                                        <p className="text-sm font-bold text-white truncate mt-1">
+                                            {formatAirportCity(group.origin, group.originIata)} → {formatAirportCity(group.destination, group.destinationIata)}
+                                        </p>
+                                    </div>
+                                </div>
+                                {isSelected && (
+                                    <span className={`text-xs font-bold px-2.5 py-1 rounded-lg ${
+                                        isRet ? "bg-purple-500/30 text-purple-200" : "bg-sky-500/30 text-sky-200"
+                                    }`}>
+                                        Active
+                                    </span>
+                                )}
+                            </button>
+                        );
+                    })}
+                </div>
+            )}
+
+            {/* ── 2. Filters (Applied to the Selected Complete Journey) ── */}
             <FlightFilters sortBy={sortBy} setSortBy={setSortBy} maxStops={maxStops} setMaxStops={setMaxStops} />
 
-            {journeyGroups.map((group, gIdx) => {
-                const isReturn     = group.direction === "return";
-                const accentBg     = isReturn ? "bg-purple-500/10"    : "bg-sky-500/10";
-                const accentBorder = isReturn ? "border-purple-500/20" : "border-sky-500/20";
-                const iconColor    = isReturn ? "text-purple-400"     : "text-sky-400";
-                const badgeCls     = isReturn
-                    ? "bg-purple-500/15 border-purple-500/30 text-purple-300"
-                    : "bg-sky-500/15 border-sky-500/30 text-sky-300";
+            {/* ── 3. Active Journey Results Container ── */}
+            <div className="space-y-4">
+                {/* Loading State */}
+                {isGroupLoading && <SkeletonLoader type="flights" />}
 
-                // Check loading state across all legs in this journey
-                const legStateList = group.legs.map(l => {
-                    const k = `${l.legNum}#${l.fromIata}#${l.toIata}#${l.date}`;
-                    return legStates[k];
-                });
-                const isGroupLoading = legStateList.some(s => !s || s.isLoading);
-                const hasGroupError  = legStateList.some(s => s && s.error);
+                {/* Error State */}
+                {!isGroupLoading && hasGroupError && allJourneys.length === 0 && (
+                    <div className="glass-panel p-6 rounded-xl border border-red-500/10 text-center space-y-3">
+                        <p className="text-red-400 text-sm">Could not find automated flights for this route.</p>
+                        <DirectBookingLinks orgCode={activeGroup.originIata} destCode={activeGroup.destinationIata} travelDate={activeGroup.date} />
+                    </div>
+                )}
 
-                // Build complete journey options from raw legs
-                const allJourneys = combineMultiLegFlights(group, legStates, finalCurrency);
-
-                // --- JOURNEY-LEVEL FILTERING & SORTING ---
-                // 1. Filter by Stops / Direct
-                let filteredJourneys = [...allJourneys];
-                const isDirectRequested = sortBy === "DIRECT" || maxStops === 0;
-
-                if (isDirectRequested) {
-                    filteredJourneys = filteredJourneys.filter(j => j.stopCount === 0);
-                } else if (maxStops !== null) {
-                    filteredJourneys = filteredJourneys.filter(j => j.stopCount <= maxStops);
-                }
-
-                // 2. Sort by selected criterion
-                if (sortBy === "CHEAPEST") {
-                    filteredJourneys.sort((a, b) => (a.totalPrice || 0) - (b.totalPrice || 0));
-                } else if (sortBy === "FASTEST") {
-                    filteredJourneys.sort((a, b) => (a.totalDurationMinutes || 0) - (b.totalDurationMinutes || 0));
-                } else if (sortBy === "DIRECT") {
-                    filteredJourneys.sort((a, b) => {
-                        if (a.stopCount !== b.stopCount) return a.stopCount - b.stopCount;
-                        return (a.totalPrice || 0) - (b.totalPrice || 0);
-                    });
-                } else {
-                    // BEST: matchScore descending, then heuristic duration + price
-                    filteredJourneys.sort((a, b) => {
-                        const scoreA = a.matchScore ?? 80;
-                        const scoreB = b.matchScore ?? 80;
-                        if (scoreA !== scoreB) return scoreB - scoreA;
-                        const algA = (a.totalPrice || 0) + (a.totalDurationMinutes || 0) * 0.5;
-                        const algB = (b.totalPrice || 0) + (b.totalDurationMinutes || 0) * 0.5;
-                        return algA - algB;
-                    });
-                }
-
-                const directFilteredOut = isDirectRequested && filteredJourneys.length === 0 && allJourneys.length > 0;
-
-                return (
-                    <motion.div
-                        key={`${group.direction}-${gIdx}`}
-                        initial={{ opacity: 0, y: 12 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ duration: 0.2, delay: gIdx * 0.06 }}
-                        className="space-y-4"
-                    >
-                        {/* Journey Group Header: Outbound / Return · Origin → Destination */}
-                        <div className={`flex items-center gap-3 px-4 py-3 rounded-xl ${accentBg} border ${accentBorder}`}>
-                            <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 ${accentBg} border ${accentBorder}`}>
-                                <Plane className={`w-3.5 h-3.5 ${iconColor} ${isReturn ? "-rotate-45" : "rotate-45"}`} />
-                            </div>
-                            <div className="flex-1 min-w-0">
-                                <div className="flex items-center gap-2 flex-wrap">
-                                    <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full border ${badgeCls}`}>
-                                        {isReturn ? "Return" : "Outbound"}
-                                    </span>
-                                    <h3 className="text-sm font-bold text-white">
-                                        {group.origin} ({group.originIata}) → {group.destination} ({group.destinationIata})
-                                    </h3>
-                                </div>
-                                <div className="flex items-center gap-1.5 text-xs text-white/40 mt-0.5 flex-wrap">
-                                    <CalendarDays className="w-3.5 h-3.5 shrink-0" />
-                                    <span>{fmtDisplay(group.date)}</span>
-                                    {group.legs.length > 1 ? (
-                                        <span className="text-white/30">
-                                            · Connecting route ({group.legs.length} flight segments)
-                                        </span>
-                                    ) : (
-                                        <span className="text-white/30"> · Commercial flight route</span>
-                                    )}
-                                </div>
-                            </div>
+                {/* Direct Filter: No Direct Flights Available */}
+                {!isGroupLoading && directFilteredOut && (
+                    <div className="glass-panel p-6 rounded-2xl border border-sky-500/20 bg-sky-500/5 text-center space-y-3">
+                        <div className="w-10 h-10 rounded-full bg-sky-500/15 flex items-center justify-center mx-auto text-sky-400">
+                            <Plane className="w-5 h-5" />
                         </div>
-
-                        {/* Journey Results Container */}
-                        <div className="space-y-4">
-                            {/* Loading State */}
-                            {isGroupLoading && <SkeletonLoader type="flights" />}
-
-                            {/* Error State */}
-                            {!isGroupLoading && hasGroupError && allJourneys.length === 0 && (
-                                <div className="glass-panel p-6 rounded-xl border border-red-500/10 text-center space-y-3">
-                                    <p className="text-red-400 text-sm">Could not find automated flights for this route.</p>
-                                    <DirectBookingLinks orgCode={group.originIata} destCode={group.destinationIata} travelDate={group.date} />
-                                </div>
-                            )}
-
-                            {/* Direct Filter: No Direct Flights Available */}
-                            {!isGroupLoading && directFilteredOut && (
-                                <div className="glass-panel p-6 rounded-2xl border border-sky-500/20 bg-sky-500/5 text-center space-y-3">
-                                    <div className="w-10 h-10 rounded-full bg-sky-500/15 flex items-center justify-center mx-auto text-sky-400">
-                                        <Plane className="w-5 h-5" />
-                                    </div>
-                                    <div>
-                                        <p className="text-white font-semibold text-sm">
-                                            No direct flights found for <span className="text-sky-300">{group.origin} ({group.originIata}) → {group.destination} ({group.destinationIata})</span>
-                                        </p>
-                                        <p className="text-white/60 text-xs mt-1">
-                                            Valid 1-stop and connecting flights are available for this route ({allJourneys.length} total options found).
-                                        </p>
-                                    </div>
-                                    <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-3">
-                                        <button
-                                            onClick={() => { setMaxStops(null); if (sortBy === "DIRECT") setSortBy("BEST"); }}
-                                            className="px-4 py-2 rounded-xl bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 border border-sky-500/40 text-xs font-semibold transition-all shadow-md cursor-pointer"
-                                        >
-                                            Show All {allJourneys.length} Available Flights
-                                        </button>
-                                    </div>
-                                    <div className="pt-3 border-t border-white/5 flex flex-wrap items-center justify-center gap-2">
-                                        <span className="text-[10px] text-white/40 font-medium">Or compare directly on booking platforms:</span>
-                                        <DirectBookingLinks orgCode={group.originIata} destCode={group.destinationIata} travelDate={group.date} />
-                                    </div>
-                                </div>
-                            )}
-
-                            {/* Empty State (Any / Stops Filtered Out) */}
-                            {!isGroupLoading && !directFilteredOut && filteredJourneys.length === 0 && (
-                                <div className="glass-panel p-6 rounded-2xl border border-white/10 text-center space-y-3">
-                                    <Search className="w-8 h-8 text-white/20 mx-auto" />
-                                    <p className="text-white/70 text-sm">
-                                        No commercial flights currently found for <strong className="text-white">{group.origin} → {group.destination}</strong> on {fmtDisplay(group.date)}
-                                    </p>
-                                    <p className="text-white/40 text-xs">Compare prices directly on booking providers:</p>
-                                    <DirectBookingLinks orgCode={group.originIata} destCode={group.destinationIata} travelDate={group.date} />
-                                </div>
-                            )}
-
-                            {/* Complete Journey Cards */}
-                            {!isGroupLoading && filteredJourneys.length > 0 && (
-                                <div className="space-y-4">
-                                    <AnimatePresence mode="popLayout">
-                                        {filteredJourneys.slice(0, 6).map((journey) => (
-                                            <motion.div
-                                                key={journey.id}
-                                                initial={{ opacity: 0, y: 8 }}
-                                                animate={{ opacity: 1, y: 0 }}
-                                                exit={{ opacity: 0 }}
-                                                transition={{ duration: 0.15 }}
-                                            >
-                                                <CompleteJourneyCard
-                                                    journey={journey}
-                                                    isReturn={isReturn}
-                                                />
-                                            </motion.div>
-                                        ))}
-                                    </AnimatePresence>
-
-                                    {/* Direct Booking Comparison Links Footer */}
-                                    <div className="flex items-center justify-center gap-2 pt-2 border-t border-white/5">
-                                        <span className="text-[10px] text-white/40 font-medium">Compare live prices on external platforms:</span>
-                                        <DirectBookingLinks orgCode={group.originIata} destCode={group.destinationIata} travelDate={group.date} />
-                                    </div>
-                                </div>
-                            )}
+                        <div>
+                            <p className="text-white font-semibold text-sm">
+                                No direct flights found for <span className="text-sky-300">{formatAirportCity(activeGroup.origin, activeGroup.originIata)} → {formatAirportCity(activeGroup.destination, activeGroup.destinationIata)}</span>
+                            </p>
+                            <p className="text-white/60 text-xs mt-1">
+                                Valid 1-stop and connecting flights are available for this route ({allJourneys.length} total options found).
+                            </p>
                         </div>
-                    </motion.div>
-                );
-            })}
+                        <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-3">
+                            <button
+                                onClick={() => { setMaxStops(null); if (sortBy === "DIRECT") setSortBy("BEST"); }}
+                                className="px-4 py-2 rounded-xl bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 border border-sky-500/40 text-xs font-semibold transition-all shadow-md cursor-pointer"
+                            >
+                                Show All {allJourneys.length} Available Flights
+                            </button>
+                        </div>
+                        <div className="pt-3 border-t border-white/5 flex flex-wrap items-center justify-center gap-2">
+                            <span className="text-[10px] text-white/40 font-medium">Or compare directly on booking platforms:</span>
+                            <DirectBookingLinks orgCode={activeGroup.originIata} destCode={activeGroup.destinationIata} travelDate={activeGroup.date} />
+                        </div>
+                    </div>
+                )}
+
+                {/* Empty State (Any / Stops Filtered Out) */}
+                {!isGroupLoading && !directFilteredOut && filteredJourneys.length === 0 && (
+                    <div className="glass-panel p-6 rounded-2xl border border-white/10 text-center space-y-3">
+                        <Search className="w-8 h-8 text-white/20 mx-auto" />
+                        <p className="text-white/70 text-sm">
+                            No commercial flights currently found for <strong className="text-white">{formatAirportCity(activeGroup.origin, activeGroup.originIata)} → {formatAirportCity(activeGroup.destination, activeGroup.destinationIata)}</strong> on {fmtDisplay(activeGroup.date)}
+                        </p>
+                        <p className="text-white/40 text-xs">Compare prices directly on booking providers:</p>
+                        <DirectBookingLinks orgCode={activeGroup.originIata} destCode={activeGroup.destinationIata} travelDate={activeGroup.date} />
+                    </div>
+                )}
+
+                {/* Complete Journey Cards */}
+                {!isGroupLoading && filteredJourneys.length > 0 && (
+                    <div className="space-y-4">
+                        <AnimatePresence mode="popLayout">
+                            {filteredJourneys.slice(0, 6).map((journey, idx) => (
+                                <motion.div
+                                    key={journey.id}
+                                    initial={{ opacity: 0, y: 8 }}
+                                    animate={{ opacity: 1, y: 0 }}
+                                    exit={{ opacity: 0 }}
+                                    transition={{ duration: 0.15 }}
+                                >
+                                    <CompleteJourneyCard
+                                        journey={journey}
+                                        isReturn={isReturn}
+                                        isTopRecommended={idx === 0 && sortBy === "BEST"}
+                                    />
+                                </motion.div>
+                            ))}
+                        </AnimatePresence>
+
+                        {/* Direct Booking Comparison Links Footer */}
+                        <div className="flex items-center justify-center gap-2 pt-2 border-t border-white/5">
+                            <span className="text-[10px] text-white/40 font-medium">Compare live prices on external platforms:</span>
+                            <DirectBookingLinks orgCode={activeGroup.originIata} destCode={activeGroup.destinationIata} travelDate={activeGroup.date} />
+                        </div>
+                    </div>
+                )}
+            </div>
         </div>
     );
 }
