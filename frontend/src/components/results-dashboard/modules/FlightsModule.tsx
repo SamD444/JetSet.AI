@@ -64,6 +64,8 @@ export interface CompleteSegment {
     airplane?: string;
     travelClass?: string;
     legroom?: string;
+    // Individual provider segment fare — only present when SerpAPI genuinely provides
+    // a per-segment price (rare). NOT the leg-level price.
     price?: number | null;
 }
 
@@ -72,6 +74,25 @@ export interface CompleteLayover {
     airportName: string;
     durationMinutes: number;
     overnight?: boolean;
+}
+
+/**
+ * Represents one independently-searched journey leg (one SerpAPI search call).
+ * A leg may contain multiple provider segments (e.g., DEL→DOH→FCO).
+ * legPrice is the genuine entry.price from SerpAPI for that search — the total
+ * cost of flying this leg, regardless of how many provider segments it contains.
+ */
+export interface SearchedLeg {
+    origin: string;
+    originIata: string;
+    destination: string;
+    destinationIata: string;
+    /** Index into journey.segments where this leg's segments begin */
+    segmentStart: number;
+    /** How many consecutive segments in journey.segments belong to this leg */
+    segmentCount: number;
+    /** Genuine SerpAPI entry.price for this searched leg. null = not provided. */
+    legPrice: number | null;
 }
 
 export interface CompleteJourney {
@@ -85,6 +106,7 @@ export interface CompleteJourney {
     departureTime: string;
     arrivalTime: string;
     totalDurationMinutes: number;
+    /** Sum of all independently-priced leg prices. 0 if no prices available. */
     totalPrice: number;
     currency: string;
     stopCount: number;
@@ -93,6 +115,12 @@ export interface CompleteJourney {
     carrierCodes: string[];
     segments: CompleteSegment[];
     layovers: CompleteLayover[];
+    /**
+     * Independently-searched legs that make up this journey.
+     * Always populated. For single-leg journeys: 1 entry.
+     * For combined multi-leg journeys: one entry per searched leg.
+     */
+    searchedLegs: SearchedLeg[];
     bookingUrl: string;
     matchScore?: number;
     matchReason?: string;
@@ -184,12 +212,17 @@ function normalizeSingleFlightToJourney(
     flight: any,
     idx: number,
     group: JourneyGroup,
-    currencyOverride?: string
+    currencyOverride?: string,
+    segmentOffset: number = 0  // used by combineMultiLegFlights to build correct searchedLegs
 ): CompleteJourney {
     const itinerary = flight.itineraries?.[0];
     const rawSegments = itinerary?.segments || [];
     const rawLayovers = itinerary?.layovers || [];
 
+    // ── Leg-level price from SerpAPI (entry.price) ──────────────────────────────
+    // This is the genuine fare for the entire independently-searched leg.
+    // It covers all provider segments within the leg (e.g., DEL→DOH→FCO = ₹29,126).
+    // It must NOT be split, duplicated, or assigned to individual provider segments.
     const rawFlightPrice =
         flight.price?.total ??
         flight.price?.raw ??
@@ -197,23 +230,32 @@ function normalizeSingleFlightToJourney(
         flight.price?.value ??
         flight.totalPrice ??
         flight.fare ??
-        flight.price ??
         null;
-    const priceVal = parsePrice(rawFlightPrice) || 0;
+    const legPriceVal = parsePrice(rawFlightPrice);
+    const priceVal = legPriceVal ?? 0;
     const currency = currencyOverride || flight.price?.currency || flight.price?.curr || "USD";
-    const hasSingleSegment = rawSegments.length === 1;
 
+    // ── Provider segments ────────────────────────────────────────────────────────
+    // Segments are individual hops returned by the airline/GDS inside one searched-leg result.
+    // Provider segment fares are only set when SerpAPI explicitly provides per-segment pricing
+    // (e.g., leg.price on individual flight objects). The leg-level fare must NOT be copied
+    // onto the first segment — it lives on SearchedLeg.legPrice instead.
     const segments: CompleteSegment[] = rawSegments.map((s: any) => {
         const carrier = s.carrierCode || "AI";
         const fromIata = s.departure?.iataCode || group.originIata;
         const toIata = s.arrival?.iataCode || group.destinationIata;
 
-        // Preserve real segment price if available on segment, or from single-segment leg search
+        // Only use an explicit per-provider-segment price if SerpAPI actually provides it.
+        // The segment-level price field (s.price) is set by the backend ONLY when the
+        // individual leg object inside the entry has its own price (leg.price / leg.ticket_price).
+        // The entry-level price (legPrice) lives on SearchedLeg.legPrice, not here.
         const rawSegPrice = s.price ?? s.ticketPrice ?? s.fare ?? s.ticket_price ?? s.rate;
         const parsedSeg = parsePrice(rawSegPrice);
-        const segPrice = parsedSeg !== null && parsedSeg > 0
+        // Only use parsedSeg if it is positive AND different from the leg-level price
+        // (avoids displaying the duplicated value placed on the first segment by older backend).
+        const segPrice = parsedSeg !== null && parsedSeg > 0 && parsedSeg !== legPriceVal
             ? parsedSeg
-            : (hasSingleSegment && priceVal > 0 ? priceVal : null);
+            : null;
 
         return {
             from: IATA_CITY_MAP[fromIata] || s.departure?.name || group.origin,
@@ -258,7 +300,7 @@ function normalizeSingleFlightToJourney(
         durationMins = segSum + laySum;
     }
 
-    // Stop count = segments.length - 1
+    // Stop count = provider segments - 1
     const stopCount = Math.max(0, segments.length - 1);
 
     // Intermediate connection airports
@@ -276,6 +318,17 @@ function normalizeSingleFlightToJourney(
 
     const bookingUrl = flight.googleFlightsUrl ||
         `https://www.google.com/travel/flights/search?q=Flights+from+${group.originIata}+to+${group.destinationIata}+on+${group.date}`;
+
+    // ── Single searched leg descriptor ──────────────────────────────────────────
+    const searchedLeg: SearchedLeg = {
+        origin: group.origin,
+        originIata: group.originIata,
+        destination: group.destination,
+        destinationIata: group.destinationIata,
+        segmentStart: segmentOffset,
+        segmentCount: segments.length,
+        legPrice: legPriceVal,
+    };
 
     return {
         id: flight.id || `journey-${group.direction}-${idx}`,
@@ -296,6 +349,7 @@ function normalizeSingleFlightToJourney(
         carrierCodes,
         segments,
         layovers,
+        searchedLegs: [searchedLeg],
         bookingUrl,
         matchScore: flight.matchScore,
         matchReason: flight.matchReason,
@@ -316,10 +370,10 @@ function combineMultiLegFlights(
         const key = `${leg.legNum}#${leg.fromIata}#${leg.toIata}#${leg.date}`;
         const state = legStates[key];
         if (!state || !state.flights || state.flights.length === 0) return [];
-        return state.flights.map((f, i) => normalizeSingleFlightToJourney(f, i, group, currencyOverride));
+        return state.flights.map((f, i) => normalizeSingleFlightToJourney(f, i, group, currencyOverride, 0));
     }
 
-    // Multi-leg combination (e.g. CCU -> DEL + DEL -> FCO)
+    // Multi-leg combination: each entry in legFlightLists is an independently-searched leg
     const legFlightLists: any[][] = [];
     for (const leg of legs) {
         const key = `${leg.legNum}#${leg.fromIata}#${leg.toIata}#${leg.date}`;
@@ -343,25 +397,41 @@ function combineMultiLegFlights(
             const f1 = list1[i];
             const f2 = list2[j];
 
-            const j1 = normalizeSingleFlightToJourney(f1, i, { ...group, destinationIata: legs[0].toIata, destination: legs[0].to }, currencyOverride);
-            const j2 = normalizeSingleFlightToJourney(f2, j, { ...group, originIata: legs[1].fromIata, origin: legs[1].from }, currencyOverride);
+            // Each leg is normalized independently.
+            // segmentOffset for j2 = number of segments in j1 (so SearchedLeg.segmentStart is correct).
+            const j1 = normalizeSingleFlightToJourney(
+                f1, i,
+                { ...group, destinationIata: legs[0].toIata, destination: legs[0].to },
+                currencyOverride,
+                0
+            );
+            const j2 = normalizeSingleFlightToJourney(
+                f2, j,
+                { ...group, originIata: legs[1].fromIata, origin: legs[1].from },
+                currencyOverride,
+                j1.segments.length  // j2 segments start right after j1 segments
+            );
 
             const allSegments = [...j1.segments, ...j2.segments];
             const transferAirportIata = legs[0].toIata;
             const transferCity = IATA_CITY_MAP[transferAirportIata] || legs[0].to || transferAirportIata;
 
-            // Layover between leg1 and leg2
+            // Transfer layover between leg1 and leg2
             const transferLayover: CompleteLayover = {
                 airportIata: transferAirportIata,
                 airportName: transferCity,
-                durationMinutes: 120, // Default 2h connection
+                durationMinutes: 120,
             };
 
             const allLayovers = [...j1.layovers, transferLayover, ...j2.layovers];
+
+            // ── Total price = sum of EACH independently-searched leg price ────────────────
+            // j1.totalPrice = genuine SerpAPI entry.price for leg1 (0 if unavailable)
+            // j2.totalPrice = genuine SerpAPI entry.price for leg2 (0 if unavailable)
+            // This is the correct total: it does NOT double-count multi-segment legs.
             const totalPrice = (j1.totalPrice || 0) + (j2.totalPrice || 0);
             const totalDurationMinutes = (j1.totalDurationMinutes || 0) + 120 + (j2.totalDurationMinutes || 0);
 
-            // Total stop count is all intermediate segments
             const stopCount = allSegments.length - 1;
             const connections = [transferCity, ...j1.connections, ...j2.connections].filter(
                 (v, idx, arr) => arr.indexOf(v) === idx && v !== group.origin && v !== group.destination
@@ -374,6 +444,11 @@ function combineMultiLegFlights(
 
             const avgScore = Math.round(((j1.matchScore || 85) + (j2.matchScore || 85)) / 2);
             const bookingUrl = `https://www.google.com/travel/flights/search?q=Flights+from+${group.originIata}+to+${group.destinationIata}+on+${group.date}`;
+
+            // ── Merge searched-leg descriptors with correct segment offsets ───────────────
+            // j1.searchedLegs already have correct offsets (segmentStart=0).
+            // j2.searchedLegs were built with segmentOffset=j1.segments.length, so they're correct.
+            const allSearchedLegs: SearchedLeg[] = [...j1.searchedLegs, ...j2.searchedLegs];
 
             combined.push({
                 id: `combined-${group.direction}-${i}-${j}`,
@@ -394,6 +469,7 @@ function combineMultiLegFlights(
                 carrierCodes,
                 segments: allSegments,
                 layovers: allLayovers,
+                searchedLegs: allSearchedLegs,
                 bookingUrl,
                 matchScore: avgScore,
                 matchReason: j1.matchReason || `Connecting route via ${transferCity}`,
@@ -608,7 +684,7 @@ function CompleteJourneyCard({
                 </div>
             </div>
 
-            {/* ── Expandable Segment Breakdown (Secondary Info with Full City Names) ── */}
+            {/* ── Expandable Segment Breakdown (Grouped by independently-searched leg) ── */}
             <AnimatePresence>
                 {showDetails && (
                     <motion.div
@@ -620,68 +696,149 @@ function CompleteJourneyCard({
                     >
                         <p className="text-xs font-bold text-white/80 uppercase tracking-wider">Flight Breakdown</p>
 
-                        <div className="space-y-3">
-                            {journey.segments.map((seg, sIdx) => (
-                                <React.Fragment key={sIdx}>
-                                    <div className="p-3.5 rounded-xl bg-white/[0.03] border border-white/5 space-y-2.5">
-                                        <div className="flex items-center justify-between text-xs">
-                                            <div className="flex items-center gap-2">
-                                                <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${accentBg} ${accentText}`}>
-                                                    {sIdx + 1}
+                        {/*
+                          * Render one group per independently-searched leg (journey.searchedLegs).
+                          * Each leg group shows:
+                          *   1. A leg header with the genuine SerpAPI leg fare (or "Price not available")
+                          *   2. The individual provider segments inside that leg
+                          *   3. Layover banners between segments / between legs
+                          *
+                          * PRICING CONTRACT:
+                          *   - legPrice = genuine entry.price from SerpAPI for this searched leg
+                          *   - segment.price = genuine per-segment price from SerpAPI (rarely available)
+                          *   - Neither is invented, divided, or estimated
+                          */}
+                        <div className="space-y-4">
+                            {(journey.searchedLegs || []).map((sl, legIdx) => {
+                                const legSegs = journey.segments.slice(sl.segmentStart, sl.segmentStart + sl.segmentCount);
+                                const isMultiLeg = (journey.searchedLegs || []).length > 1;
+
+                                return (
+                                    <div key={legIdx} className="space-y-2">
+                                        {/* Leg header — only shown for multi-leg combined journeys */}
+                                        {isMultiLeg && (
+                                            <div className={`flex items-center justify-between px-3.5 py-2 rounded-xl border text-xs font-semibold ${
+                                                isReturn
+                                                    ? "bg-purple-500/10 border-purple-500/25 text-purple-200"
+                                                    : "bg-sky-500/10 border-sky-500/25 text-sky-200"
+                                            }`}>
+                                                <div className="flex items-center gap-2">
+                                                    <Plane className={`w-3.5 h-3.5 shrink-0 ${isReturn ? "text-purple-400 -rotate-45" : "text-sky-400 rotate-45"}`} />
+                                                    <span>
+                                                        Flight {legIdx + 1}: {formatAirportCity(sl.origin, sl.originIata)} → {formatAirportCity(sl.destination, sl.destinationIata)}
+                                                    </span>
+                                                </div>
+                                                <span className="font-bold text-white">
+                                                    {sl.legPrice !== null && sl.legPrice > 0
+                                                        ? `${journey.currency} ${sl.legPrice.toLocaleString()}`
+                                                        : "Check live"}
                                                 </span>
-                                                <span className="font-bold text-white">Segment {sIdx + 1}: {seg.airlineName}</span>
-                                                {seg.flightNumber && <span className="font-mono text-white/40 text-[11px]">· {seg.flightNumber}</span>}
-                                            </div>
-                                            <span className="text-white/60 text-xs font-medium">{formatMins(seg.durationMinutes)}</span>
-                                        </div>
-
-                                        {/* Full City + Airport Name Timeline */}
-                                        <div className="flex items-center justify-between text-xs px-2 py-1 bg-white/[0.02] rounded-lg">
-                                            <div className="text-left">
-                                                <p className="font-bold text-white">{seg.departureTime}</p>
-                                                <p className="text-[11px] text-white/70">{formatAirportCity(seg.from, seg.fromIata)}</p>
-                                            </div>
-                                            <div className="flex flex-col items-center px-2">
-                                                <span className="text-[10px] text-white/40 mb-0.5">{formatMins(seg.durationMinutes)}</span>
-                                                <Plane className="w-3.5 h-3.5 text-white/30" />
-                                            </div>
-                                            <div className="text-right">
-                                                <p className="font-bold text-white">{seg.arrivalTime}</p>
-                                                <p className="text-[11px] text-white/70">{formatAirportCity(seg.to, seg.toIata)}</p>
-                                            </div>
-                                        </div>
-
-                                        {(seg.airplane || seg.travelClass) && (
-                                            <div className="flex items-center gap-2 text-[10px] text-white/40 pt-0.5">
-                                                {seg.airplane && <span>{seg.airplane}</span>}
-                                                {seg.airplane && seg.travelClass && <span>·</span>}
-                                                {seg.travelClass && <span>{seg.travelClass}</span>}
                                             </div>
                                         )}
 
-                                        {/* Segment Price Information */}
-                                        <div className="flex items-center justify-between text-[11px] text-white/50 pt-1 border-t border-white/5">
-                                            <span>Segment fare:</span>
-                                            <span className="text-white/80 font-semibold">
-                                                {seg.price !== null && seg.price !== undefined && !isNaN(Number(seg.price)) && Number(seg.price) > 0
-                                                    ? `${journey.currency} ${Number(seg.price).toLocaleString()}`
-                                                    : "Included in total journey price"}
-                                            </span>
+                                        {/* Provider segments within this leg */}
+                                        <div className="space-y-2 pl-0">
+                                            {legSegs.map((seg, localIdx) => {
+                                                const globalIdx = sl.segmentStart + localIdx;
+                                                const hasOwnSegPrice = seg.price !== null && seg.price !== undefined && !isNaN(Number(seg.price)) && Number(seg.price) > 0;
+
+                                                return (
+                                                    <React.Fragment key={globalIdx}>
+                                                        <div className="p-3.5 rounded-xl bg-white/[0.03] border border-white/5 space-y-2.5">
+                                                            <div className="flex items-center justify-between text-xs">
+                                                                <div className="flex items-center gap-2">
+                                                                    <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${accentBg} ${accentText}`}>
+                                                                        {globalIdx + 1}
+                                                                    </span>
+                                                                    <span className="font-bold text-white">Segment {globalIdx + 1}: {seg.airlineName}</span>
+                                                                    {seg.flightNumber && <span className="font-mono text-white/40 text-[11px]">· {seg.flightNumber}</span>}
+                                                                </div>
+                                                                <span className="text-white/60 text-xs font-medium">{formatMins(seg.durationMinutes)}</span>
+                                                            </div>
+
+                                                            {/* Route timeline */}
+                                                            <div className="flex items-center justify-between text-xs px-2 py-1 bg-white/[0.02] rounded-lg">
+                                                                <div className="text-left">
+                                                                    <p className="font-bold text-white">{seg.departureTime}</p>
+                                                                    <p className="text-[11px] text-white/70">{formatAirportCity(seg.from, seg.fromIata)}</p>
+                                                                </div>
+                                                                <div className="flex flex-col items-center px-2">
+                                                                    <span className="text-[10px] text-white/40 mb-0.5">{formatMins(seg.durationMinutes)}</span>
+                                                                    <Plane className="w-3.5 h-3.5 text-white/30" />
+                                                                </div>
+                                                                <div className="text-right">
+                                                                    <p className="font-bold text-white">{seg.arrivalTime}</p>
+                                                                    <p className="text-[11px] text-white/70">{formatAirportCity(seg.to, seg.toIata)}</p>
+                                                                </div>
+                                                            </div>
+
+                                                            {(seg.airplane || seg.travelClass) && (
+                                                                <div className="flex items-center gap-2 text-[10px] text-white/40 pt-0.5">
+                                                                    {seg.airplane && <span>{seg.airplane}</span>}
+                                                                    {seg.airplane && seg.travelClass && <span>·</span>}
+                                                                    {seg.travelClass && <span>{seg.travelClass}</span>}
+                                                                </div>
+                                                            )}
+
+                                                            {/* Segment fare row */}
+                                                            <div className="flex items-center justify-between text-[11px] text-white/50 pt-1 border-t border-white/5">
+                                                                <span>Segment fare:</span>
+                                                                <span className="text-white/80 font-semibold">
+                                                                    {hasOwnSegPrice
+                                                                        // SerpAPI provided an explicit per-segment fare
+                                                                        ? `${journey.currency} ${Number(seg.price).toLocaleString()}`
+                                                                        // No per-segment fare — point to leg fare or journey total
+                                                                        : isMultiLeg && sl.legPrice !== null && sl.legPrice > 0
+                                                                            ? sl.segmentCount > 1
+                                                                                ? "Included in flight fare above"
+                                                                                : `${journey.currency} ${sl.legPrice.toLocaleString()}`
+                                                                            : !isMultiLeg && journey.totalPrice > 0
+                                                                                ? journey.segments.length === 1
+                                                                                    ? `${journey.currency} ${journey.totalPrice.toLocaleString()}`
+                                                                                    : "Included in total journey price"
+                                                                                : "Price not available"
+                                                                    }
+                                                                </span>
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Intra-leg layover (between segments of the same searched leg) */}
+                                                        {localIdx < legSegs.length - 1 && (() => {
+                                                            // Find the layover at globalIdx within journey.layovers
+                                                            const lv = journey.layovers[globalIdx];
+                                                            if (!lv) return null;
+                                                            return (
+                                                                <div className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-300 text-xs">
+                                                                    <div className="flex items-center gap-2">
+                                                                        <Clock className="w-3.5 h-3.5 shrink-0" />
+                                                                        <span>Connection at <strong>{formatAirportCity(lv.airportName, lv.airportIata)}</strong></span>
+                                                                    </div>
+                                                                    <span className="font-semibold">{formatMins(lv.durationMinutes)} transfer</span>
+                                                                </div>
+                                                            );
+                                                        })()}
+
+                                                        {/* Inter-leg transfer (between searched legs) — shown after last segment of each leg except the final one */}
+                                                        {localIdx === legSegs.length - 1 && legIdx < (journey.searchedLegs || []).length - 1 && (() => {
+                                                            const lv = journey.layovers[globalIdx];
+                                                            if (!lv) return null;
+                                                            return (
+                                                                <div className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-300 text-xs">
+                                                                    <div className="flex items-center gap-2">
+                                                                        <Clock className="w-3.5 h-3.5 shrink-0" />
+                                                                        <span>Transfer at <strong>{formatAirportCity(lv.airportName, lv.airportIata)}</strong></span>
+                                                                    </div>
+                                                                    <span className="font-semibold">{formatMins(lv.durationMinutes)} layover</span>
+                                                                </div>
+                                                            );
+                                                        })()}
+                                                    </React.Fragment>
+                                                );
+                                            })}
                                         </div>
                                     </div>
-
-                                    {/* Layover banner if not the last segment */}
-                                    {journey.layovers[sIdx] && (
-                                        <div className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-300 text-xs">
-                                            <div className="flex items-center gap-2">
-                                                <Clock className="w-3.5 h-3.5 shrink-0" />
-                                                <span>Connection at <strong>{formatAirportCity(journey.layovers[sIdx].airportName, journey.layovers[sIdx].airportIata)}</strong></span>
-                                            </div>
-                                            <span className="font-semibold">{formatMins(journey.layovers[sIdx].durationMinutes)} transfer</span>
-                                        </div>
-                                    )}
-                                </React.Fragment>
-                            ))}
+                                );
+                            })}
                         </div>
                     </motion.div>
                 )}

@@ -317,8 +317,12 @@ export class FlightsService {
             const airlineName: string = leg.airline || '';
             const flightNumber: string = leg.flight_number || '';
 
-            // Associate real fare: if explicit leg price exists, or for single-segment flight use priceRaw
-            const legFare = leg.price ?? leg.ticket_price ?? leg.fare ?? (legs.length === 1 && priceRaw !== null ? priceRaw : null);
+            // Segment-level fare: only assign when SerpAPI explicitly provides
+            // a per-provider-segment price (leg.price / leg.ticket_price / leg.fare).
+            // The entry-level price (entry.price = priceRaw) is the fare for the ENTIRE
+            // searched leg. It is preserved in price.total and displayed via SearchedLeg.legPrice
+            // on the frontend — it must NOT be copied onto individual provider segments.
+            const legFare = leg.price ?? leg.ticket_price ?? leg.fare ?? null;
 
             return {
                 departure: {
