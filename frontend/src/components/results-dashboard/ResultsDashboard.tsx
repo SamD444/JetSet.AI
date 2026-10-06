@@ -216,13 +216,33 @@ export default function ResultsDashboard({ tripId, org, dest, dates, displayDate
     useEffect(() => {
         const handleSwitchTab = (e: Event) => {
             const customEvent = e as CustomEvent;
-            const targetTab = customEvent.detail;
+            const detail = customEvent.detail;
+
+            // Support both structured { tabId, affectedTabs } and legacy plain-string format
+            let targetTab: string;
+            let affectedTabs: string[];
+            if (detail && typeof detail === 'object' && detail.tabId) {
+                targetTab = detail.tabId;
+                affectedTabs = Array.isArray(detail.affectedTabs) && detail.affectedTabs.length
+                    ? detail.affectedTabs
+                    : [targetTab];
+            } else {
+                targetTab = detail as string;
+                affectedTabs = targetTab ? [targetTab] : [];
+            }
+
             if (targetTab && TABS.some(t => t.id === targetTab)) {
                 setActiveTab(targetTab);
                 if (!visitedTabs.includes(targetTab)) {
                     setVisitedTabs((prev) => [...prev, targetTab]);
                 }
-                triggerTabHighlight([targetTab]);
+                // Ensure all affected tabs are in visitedTabs so they mount
+                affectedTabs.forEach(tab => {
+                    if (TABS.some(t => t.id === tab)) {
+                        setVisitedTabs(prev => prev.includes(tab) ? prev : [...prev, tab]);
+                    }
+                });
+                triggerTabHighlight(affectedTabs.filter(tab => TABS.some(t => t.id === tab)));
             }
         };
         window.addEventListener("switch-tab", handleSwitchTab);
@@ -234,12 +254,35 @@ export default function ResultsDashboard({ tripId, org, dest, dates, displayDate
         const handleTripUpdated = (e: Event) => {
             const detail = (e as CustomEvent).detail || {};
             applyCanonicalTripUpdate(detail);
-            const affected: string[] = [];
-            if (detail.fromDate || detail.toDate || detail.origin) affected.push("flights", "itinerary");
-            if (detail.destination) affected.push("summary", "flights", "hotels", "itinerary", "season");
-            if (detail.budget || detail.companions) affected.push("hotels");
-            if (affected.length === 0) affected.push("summary");
-            triggerTabHighlight(Array.from(new Set(affected)));
+
+            // Use structured affectedTabs/primaryTab from the event if the backend provided them,
+            // otherwise fall back to computing them locally from the changed fields.
+            let affected: string[];
+            let primary: string;
+            if (Array.isArray(detail.affectedTabs) && detail.affectedTabs.length > 0) {
+                affected = detail.affectedTabs;
+                primary = detail.primaryTab || affected[0];
+            } else {
+                affected = [];
+                if (detail.fromDate || detail.toDate || detail.origin) affected.push('flights', 'itinerary');
+                if (detail.destination) affected.push('summary', 'flights', 'hotels', 'itinerary', 'season');
+                if (detail.budget || detail.companions) affected.push('hotels');
+                if (affected.length === 0) affected.push('summary');
+                primary = 'summary';
+            }
+
+            const uniqueAffected = Array.from(new Set(affected));
+            triggerTabHighlight(uniqueAffected);
+
+            // Navigate to the primary tab so the user sees the most relevant changed section
+            if (primary && TABS.some(t => t.id === primary)) {
+                setActiveTab(primary);
+                setVisitedTabs(prev => {
+                    const next = [...prev];
+                    uniqueAffected.forEach(tab => { if (!next.includes(tab)) next.push(tab); });
+                    return next;
+                });
+            }
         };
 
         window.addEventListener("copilot-trip-updated", handleTripUpdated);

@@ -123,11 +123,12 @@ export class LlmService {
               type: 'function',
               function: {
                 name: 'switch_tab',
-                description: 'Switch the dashboard tab if the user wants to view flights, hotels, or their itinerary.',
+                description: 'Navigate the dashboard to a specific tab. Use this ONLY when the user explicitly asks to VIEW a section (e.g. "show me flights", "open summary", "show itinerary"). Tab mapping: summary=AI Summary/budget/overview, flights=Flights/flight dates, hotels=Stays/hotels/accommodation, season=When to Go/best time, itinerary=Itinerary/day plans. For a single-section request, set primaryTab only. For multi-section requests, set both primaryTab and affectedTabs.',
                 parameters: {
                   type: 'object',
                   properties: {
-                    tabId: { type: 'string', enum: ['summary', 'flights', 'hotels', 'season', 'itinerary'] },
+                    tabId: { type: 'string', enum: ['summary', 'flights', 'hotels', 'season', 'itinerary'], description: 'The primary tab to navigate to (REQUIRED).' },
+                    affectedTabs: { type: 'array', items: { type: 'string', enum: ['summary', 'flights', 'hotels', 'season', 'itinerary'] }, description: 'All tabs that are affected/relevant to this action, including the primary tab. Omit or leave empty for single-tab actions.' },
                   },
                   required: ['tabId'],
                 },

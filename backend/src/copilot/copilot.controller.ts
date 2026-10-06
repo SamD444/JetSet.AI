@@ -138,6 +138,8 @@ export class CopilotController {
               const mutationPayload: CopilotResponsePayload = {
                 itineraryUpdated: true,
                 updatedItinerary: result.updatedItinerary,
+                affectedTabs: ['itinerary'],
+                primaryTab: 'itinerary',
                 content: streamedAnyContent ? `\n\n${result.confirmation}` : result.confirmation,
               };
               res.write(`data: ${JSON.stringify(mutationPayload)}\n\n`);
@@ -153,15 +155,36 @@ export class CopilotController {
               if (result.updatedTrip?.id) {
                 effectiveTripId = result.updatedTrip.id;
               }
+              const affected = computeAffectedTabs(result.updatedFields || Object.keys(args));
               const mutationPayload: CopilotResponsePayload = {
                 tripUpdated: true,
                 updatedTrip: result.updatedTrip || args,
+                affectedTabs: affected.affectedTabs,
+                primaryTab: affected.primaryTab,
                 content: streamedAnyContent ? `\n\n${result.confirmation}` : result.confirmation,
               };
               res.write(`data: ${JSON.stringify(mutationPayload)}\n\n`);
             }
           } catch (e: any) {
             // Log error
+          }
+        } else if (toolCall.name === 'switch_tab') {
+          try {
+            const args = JSON.parse(toolCall.arguments || '{}');
+            if (args.tabId) {
+              const tabPayload: CopilotResponsePayload = {
+                toolCalls: [{
+                  id: `call_switch_tab_exec`,
+                  type: 'function',
+                  function: { name: 'switch_tab', arguments: toolCall.arguments },
+                }],
+                affectedTabs: args.affectedTabs?.length ? args.affectedTabs : [args.tabId],
+                primaryTab: args.tabId,
+              };
+              res.write(`data: ${JSON.stringify(tabPayload)}\n\n`);
+            }
+          } catch (e: any) {
+            // ignore
           }
         }
       }
@@ -189,6 +212,8 @@ export class CopilotController {
               }],
               itineraryUpdated: true,
               updatedItinerary: result.updatedItinerary,
+              affectedTabs: ['itinerary'],
+              primaryTab: 'itinerary',
               content: streamedAnyContent ? `\n\n${result.confirmation}` : result.confirmation,
             })}\n\n`);
           }
@@ -315,6 +340,7 @@ export class CopilotController {
               if (result.updatedTrip?.id) {
                 effectiveTripId = result.updatedTrip.id;
               }
+              const affected = computeAffectedTabs(result.updatedFields || Object.keys(detectedModifications));
               res.write(
                 `data: ${JSON.stringify({
                   toolCalls: [
@@ -326,6 +352,8 @@ export class CopilotController {
                   ],
                   tripUpdated: true,
                   updatedTrip: result.updatedTrip,
+                  affectedTabs: affected.affectedTabs,
+                  primaryTab: affected.primaryTab,
                   content: streamedAnyContent ? `\n\n${result.confirmation}` : result.confirmation,
                 })}\n\n`,
               );
@@ -344,4 +372,65 @@ export class CopilotController {
       res.end();
     }
   }
+}
+
+/**
+ * Deterministically compute which dashboard tabs are affected by a trip modification
+ * and which single tab should be the primary navigation destination.
+ *
+ * Priority order for primary tab:
+ *   destination change → summary
+ *   date-only change   → summary
+ *   origin-only        → flights
+ *   budget/companions  → hotels
+ *   fallback           → summary
+ */
+function computeAffectedTabs(updatedFields: string[]): { primaryTab: string; affectedTabs: string[] } {
+  const fields = new Set(updatedFields.map(f => f.toLowerCase()));
+
+  const hasDestination = fields.has('destination');
+  const hasDates = fields.has('fromdate') || fields.has('todate');
+  const hasOrigin = fields.has('origin');
+  const hasBudget = fields.has('budget');
+  const hasCompanions = fields.has('companions');
+
+  const affectedSet = new Set<string>();
+  let primaryTab = 'summary';
+
+  if (hasDestination) {
+    // Full destination change: all modules need to regenerate
+    affectedSet.add('summary');
+    affectedSet.add('flights');
+    affectedSet.add('hotels');
+    affectedSet.add('season');
+    affectedSet.add('itinerary');
+    primaryTab = 'summary';
+  } else {
+    // Partial update: add only the relevant tabs
+    if (hasDates) {
+      affectedSet.add('summary');
+      affectedSet.add('flights');
+      affectedSet.add('hotels');
+      affectedSet.add('itinerary');
+      primaryTab = 'summary';
+    }
+    if (hasOrigin) {
+      affectedSet.add('flights');
+      if (!hasDates) primaryTab = 'flights';
+    }
+    if (hasBudget || hasCompanions) {
+      affectedSet.add('hotels');
+      affectedSet.add('summary');
+      if (!hasDates && !hasOrigin) primaryTab = 'hotels';
+    }
+  }
+
+  // Always include primaryTab in affected
+  affectedSet.add(primaryTab);
+
+  if (affectedSet.size === 0) {
+    affectedSet.add('summary');
+  }
+
+  return { primaryTab, affectedTabs: Array.from(affectedSet) };
 }

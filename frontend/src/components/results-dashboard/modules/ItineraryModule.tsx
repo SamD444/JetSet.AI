@@ -55,10 +55,20 @@ export default function ItineraryModule({ tripId, org, dest, dates }: ModuleProp
     const [expandedDays, setExpandedDays] = useState<Set<number>>(new Set([1]));
     const fetchedRef = useRef(false);
 
+    // Expand all days in a parsed itinerary
+    const expandAllDays = (text: string) => {
+        const newDays = parseItinerary(text);
+        setExpandedDays(prev => {
+            const next = new Set(prev);
+            newDays.forEach(d => next.add(d.day));
+            return next;
+        });
+    };
+
     useEffect(() => {
         if (fetchedRef.current) return;
         fetchedRef.current = true;
-        fetchItinerary();
+        loadItinerary();
     }, [tripId]);
 
     // Listen for real-time Copilot itinerary updates
@@ -67,24 +77,67 @@ export default function ItineraryModule({ tripId, org, dest, dates }: ModuleProp
             const customEvent = e as CustomEvent;
             const updated = customEvent.detail?.updatedItinerary;
             if (updated) {
+                // Direct in-memory update — module is mounted, just apply state
                 setItinerary(updated);
                 setIsLoading(false);
                 setError("");
-                const newDays = parseItinerary(updated);
-                setExpandedDays(prev => {
-                    const next = new Set(prev);
-                    newDays.forEach(d => next.add(d.day));
-                    return next;
-                });
+                expandAllDays(updated);
             } else {
+                // No inline data — force re-fetch from DB to pick up the persisted edit
                 fetchedRef.current = false;
-                fetchItinerary();
+                loadItinerary();
             }
         };
 
         window.addEventListener("copilot-itinerary-updated", handleItineraryUpdated);
         return () => window.removeEventListener("copilot-itinerary-updated", handleItineraryUpdated);
     }, []);
+
+    /**
+     * Primary load strategy:
+     * 1. Try GET /trips/:id to read the persisted combinedPlan from the database.
+     *    If combinedPlan contains an itinerary section, show it immediately — no AI needed.
+     * 2. If no persisted itinerary exists, fall back to AI generation via /ai/chat.
+     */
+    const loadItinerary = async () => {
+        setIsLoading(true);
+        setError("");
+
+        // Step 1: Try to load persisted itinerary from DB
+        if (tripId) {
+            try {
+                const baseUrl = getApiUrl();
+                const res = await fetch(`${baseUrl}/trips/${tripId}`);
+                if (res.ok) {
+                    const tripData = await res.json();
+                    if (tripData?.combinedPlan) {
+                        // Extract itinerary section from combinedPlan
+                        const itin = extractItinerarySection(tripData.combinedPlan);
+                        if (itin && itin.includes('Day 1')) {
+                            setItinerary(itin);
+                            setIsLoading(false);
+                            expandAllDays(itin);
+                            return; // Done — no AI call needed
+                        }
+                    }
+                }
+            } catch {
+                // Fall through to AI generation
+            }
+        }
+
+        // Step 2: No persisted itinerary — generate via AI
+        await fetchItinerary();
+    };
+
+    /** Extract the itinerary section from a combinedPlan string */
+    const extractItinerarySection = (plan: string): string => {
+        const match = plan.match(/---ITINERARY_START---([\s\S]*?)---ITINERARY_END---/);
+        if (match) return match[1].trim();
+        // Fallback: if the plan itself looks like an itinerary
+        if (plan.includes('Day 1')) return plan.trim();
+        return '';
+    };
 
     const fetchItinerary = async () => {
         setIsLoading(true);
@@ -197,7 +250,7 @@ Be specific with landmarks, restaurants, transport tips, and timings. Keep it pr
                 <AlertCircle className="w-10 h-10 text-red-400" />
                 <p className="text-white/80 font-sans">{error}</p>
                 <button
-                    onClick={() => { fetchedRef.current = false; fetchItinerary(); }}
+                    onClick={() => { fetchedRef.current = false; loadItinerary(); }}
                     className="text-cyan-400 border border-cyan-500/30 rounded-xl px-4 py-2 text-sm hover:bg-cyan-500/10 transition-colors"
                 >
                     Retry

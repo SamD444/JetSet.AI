@@ -189,8 +189,13 @@ export function CopilotSheet() {
               window.dispatchEvent(new CustomEvent('copilot-itinerary-updated', {
                 detail: { updatedItinerary: payload.updatedItinerary, tripId }
               }));
+              // Navigate to itinerary tab; highlight only itinerary
+              const affectedTabs = payload.affectedTabs?.length ? payload.affectedTabs : ['itinerary'];
+              const primaryTab = payload.primaryTab || 'itinerary';
               setTimeout(() => {
-                window.dispatchEvent(new CustomEvent('switch-tab', { detail: 'itinerary' }));
+                window.dispatchEvent(new CustomEvent('switch-tab', {
+                  detail: { tabId: primaryTab, affectedTabs }
+                }));
               }, 300);
             }
             if (payload.tripUpdated && payload.updatedTrip) {
@@ -200,8 +205,10 @@ export function CopilotSheet() {
               if (updatedTrip.id) {
                 setTripId(updatedTrip.id);
               }
+              const affectedTabs = payload.affectedTabs?.length ? payload.affectedTabs : ['summary'];
+              const primaryTab = payload.primaryTab || 'summary';
               window.dispatchEvent(new CustomEvent('copilot-trip-updated', {
-                detail: payload.updatedTrip
+                detail: { ...payload.updatedTrip, affectedTabs, primaryTab }
               }));
 
               // If user is not currently on the results page for this trip, transition to ResultsDashboard!
@@ -218,6 +225,13 @@ export function CopilotSheet() {
 
                 const resultsUrl = `/results/${updatedTrip.id}?org=${orgParam}&dest=${destParam}&dates=${datesParam}&displayDates=${displayDatesParam}${currParam}`;
                 router.push(resultsUrl);
+              } else {
+                // Already on results page — switch to the primary affected tab
+                setTimeout(() => {
+                  window.dispatchEvent(new CustomEvent('switch-tab', {
+                    detail: { tabId: primaryTab, affectedTabs }
+                  }));
+                }, 600);
               }
             }
             if (payload.toolCalls && payload.toolCalls.length > 0) {
@@ -234,25 +248,25 @@ export function CopilotSheet() {
                  const args = JSON.parse(tool.function.arguments || '{}');
                  setStatusText(`Opening ${args.tabId || 'requested'} tab...`);
                  if (args.tabId) {
-                   window.dispatchEvent(new CustomEvent('switch-tab', { detail: args.tabId }));
+                   // Use structured affectedTabs from the tool args (set by backend) or SSE payload
+                   const affectedTabs = payload.affectedTabs?.length
+                     ? payload.affectedTabs
+                     : (args.affectedTabs?.length ? args.affectedTabs : [args.tabId]);
+                   window.dispatchEvent(new CustomEvent('switch-tab', {
+                     detail: { tabId: args.tabId, affectedTabs }
+                   }));
                    appendContent(`\n\n*Opening ${args.tabId} tab...*`);
                  }
                } else if (tool.function.name === 'modify_trip') {
                  hasNavigatedOrSwitchedRef.current = true;
-                 const args = JSON.parse(tool.function.arguments || '{}');
                  setStatusText('Updating your trip parameters...');
-                 // Switch to the most relevant tab after modification
-                 if (args.fromDate || args.toDate) {
-                   setTimeout(() => window.dispatchEvent(new CustomEvent('switch-tab', { detail: 'flights' })), 800);
-                 } else if (args.budget || args.companions) {
-                   setTimeout(() => window.dispatchEvent(new CustomEvent('switch-tab', { detail: 'hotels' })), 800);
-                 }
+                 // Tab routing is handled by the tripUpdated payload above; no redundant switch here
                } else if (tool.function.name === 'edit_itinerary') {
                  hasNavigatedOrSwitchedRef.current = true;
                  const args = JSON.parse(tool.function.arguments || '{}');
                  setStatusText('Updating your itinerary...');
                  window.dispatchEvent(new CustomEvent('copilot-edit-itinerary', { detail: args }));
-                 setTimeout(() => window.dispatchEvent(new CustomEvent('switch-tab', { detail: 'itinerary' })), 600);
+                 // Tab navigation handled by itineraryUpdated payload above
                } else {
                  setStatusText('Working on your request...');
                }

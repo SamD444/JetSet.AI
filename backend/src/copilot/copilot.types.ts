@@ -34,6 +34,10 @@ export interface CopilotResponsePayload {
   updatedItinerary?: string;
   tripUpdated?: boolean;
   updatedTrip?: Record<string, any>;
+  /** All dashboard tabs affected by the action (for multi-tab highlighting) */
+  affectedTabs?: string[];
+  /** The single tab to navigate to as the primary destination */
+  primaryTab?: string;
 }
 
 export interface BookingConfirmationChallenge {
