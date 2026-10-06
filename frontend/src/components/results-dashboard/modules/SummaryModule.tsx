@@ -177,11 +177,13 @@ export default function SummaryModule({ tripId }: ModuleProps) {
     const renderLine = (line: string, idx: number): React.ReactNode => {
         const trimmed = line.trim();
         if (trimmed.startsWith("## ") && !trimmed.startsWith("### ")) {
+            const rawHeading = trimmed.slice(3).trim();
+            const headingText = rawHeading.replace(/^AI Blueprint Synthesis/i, "Trip Overview");
             return (
                 <div key={idx} className="mt-6 mb-3">
                     <h2 className="text-xl font-bold font-syne text-white flex items-center gap-2">
                         <span className="w-1.5 h-5 rounded-full bg-violet-500 inline-block flex-shrink-0" />
-                        {parseInlineFormatting(trimmed.slice(3))}
+                        {parseInlineFormatting(headingText)}
                     </h2>
                 </div>
             );
