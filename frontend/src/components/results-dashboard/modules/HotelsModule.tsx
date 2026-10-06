@@ -78,7 +78,22 @@ export default function HotelsModule({ tripId, dest, dates, curr }: ModuleProps)
 
     useEffect(() => {
         if (tripId) fetchStops();
-    }, [tripId, fetchStops]);
+    }, [tripId, dest, dates, fetchStops]);
+
+    // Listen for trip and itinerary updates to immediately invalidate and refresh hotel coverage
+    useEffect(() => {
+        const handleTripOrItinUpdated = () => {
+            fetchedKeys.current.clear();
+            fetchStops();
+        };
+
+        window.addEventListener("copilot-trip-updated", handleTripOrItinUpdated);
+        window.addEventListener("copilot-itinerary-updated", handleTripOrItinUpdated);
+        return () => {
+            window.removeEventListener("copilot-trip-updated", handleTripOrItinUpdated);
+            window.removeEventListener("copilot-itinerary-updated", handleTripOrItinUpdated);
+        };
+    }, [fetchStops]);
 
     // ── 3. Poll if plan is still being generated ──────────────────────────────
     useEffect(() => {
@@ -167,7 +182,7 @@ export default function HotelsModule({ tripId, dest, dates, curr }: ModuleProps)
         } catch (e: any) {
             setStopStates(p => ({
                 ...p,
-                [idx]: { isLoading: false, hotels: [], error: e.message || "Error loading stays", selectedHotelId: null, cityCode: "" },
+                [idx]: { isLoading: false, hotels: [], error: e.message || "Error loading hotels", selectedHotelId: null, cityCode: "" },
             }));
         }
     }, [tripId, curr, resolveCityCode, API]);
@@ -198,7 +213,7 @@ export default function HotelsModule({ tripId, dest, dates, curr }: ModuleProps)
             <div className="w-full h-full pb-10">
                 <div className="flex justify-between items-center mb-8">
                     <h2 className="text-xl font-bold text-white flex items-baseline gap-2">
-                        Stays by Itinerary
+                        Hotels by Itinerary
                         <span className="text-white/40 text-base font-normal">(loading…)</span>
                     </h2>
                 </div>
@@ -218,7 +233,7 @@ export default function HotelsModule({ tripId, dest, dates, curr }: ModuleProps)
         return (
             <div className="w-full h-full pb-10">
                 <div className="flex justify-between items-center mb-8">
-                    <h2 className="text-xl font-bold text-white">Stays by Itinerary</h2>
+                    <h2 className="text-xl font-bold text-white">Hotels by Itinerary</h2>
                 </div>
                 <div className="glass-panel rounded-2xl p-10 flex flex-col items-center justify-center gap-4 border border-white/10">
                     <div className="w-12 h-12 rounded-full bg-sky-500/15 flex items-center justify-center">
@@ -245,7 +260,7 @@ export default function HotelsModule({ tripId, dest, dates, curr }: ModuleProps)
         return (
             <div className="w-full h-full pb-10">
                 <div className="flex justify-between items-center mb-8">
-                    <h2 className="text-xl font-bold text-white">Stays by Itinerary</h2>
+                    <h2 className="text-xl font-bold text-white">Hotels by Itinerary</h2>
                 </div>
                 <div className="glass-panel rounded-2xl p-8 flex flex-col items-center gap-4 border border-red-500/20">
                     <p className="text-white/60 text-sm">Could not load itinerary stops.</p>
@@ -267,7 +282,7 @@ export default function HotelsModule({ tripId, dest, dates, curr }: ModuleProps)
             {/* Header */}
             <div className="flex justify-between items-center mb-6">
                 <h2 className="text-xl font-bold text-white flex items-baseline gap-2">
-                    Stays by Itinerary
+                    Hotels by Itinerary
                     <span className="text-white/40 text-base font-normal">
                         ({totalOptions} options across {stops.length} {stops.length === 1 ? "stop" : "stops"})
                     </span>
@@ -351,7 +366,7 @@ export default function HotelsModule({ tripId, dest, dates, curr }: ModuleProps)
             ) : activeState.hotels.length === 0 ? (
                 <div className="glass-panel p-8 text-center text-white/40 text-sm rounded-2xl border border-white/10">
                     <MapPin className="w-8 h-8 mx-auto mb-3 text-white/20" />
-                    <p>No stays found for <strong className="text-white/60">{activeStop?.city}</strong>.</p>
+                    <p>No hotels found for <strong className="text-white/60">{activeStop?.city}</strong>.</p>
                     <p className="text-xs mt-1 text-white/30">This city may not have bookable hotels in the API yet.</p>
                 </div>
             ) : (

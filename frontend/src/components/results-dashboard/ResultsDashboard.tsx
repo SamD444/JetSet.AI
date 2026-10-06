@@ -28,7 +28,7 @@ interface ResultsDashboardProps {
 const TABS = [
     { id: "summary", label: "AI Summary", icon: Sparkles, color: "text-violet-400" },
     { id: "flights", label: "Flights", icon: Plane, color: "text-sky-vivid" },
-    { id: "hotels", label: "Stays", icon: Hotel, color: "text-emerald-400" },
+    { id: "hotels", label: "Hotels", icon: Hotel, color: "text-emerald-400" },
     { id: "season", label: "When to Go", icon: CloudSun, color: "text-amber-400" },
     { id: "itinerary", label: "Itinerary", icon: Map, color: "text-cyan-400" },
     { id: "transit", label: "Transit & Stays", icon: TrainFront, color: "text-teal-400" },

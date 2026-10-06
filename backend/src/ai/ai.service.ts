@@ -7,7 +7,13 @@ import { RagService } from '../rag/rag.service';
 import { normalizeAndHash } from '../common/normalize';
 import { OpenRouterService, OpenRouterMessage } from '../openrouter/openrouter.service';
 import { GoogleGenAI } from '@google/genai';
-import { calculateCalendarDays, adaptItineraryForDates } from '../common/itinerary-date.utils';
+import {
+  calculateCalendarDays,
+  adaptItineraryForDates,
+  getDateForDay,
+  formatDayDateDisplay,
+  parseItineraryDays,
+} from '../common/itinerary-date.utils';
 // @ts-ignore
 import { MultiFormatReader, RGBLuminanceSource, BinaryBitmap, HybridBinarizer } from '@zxing/library';
 export interface ItineraryStopDto {
@@ -1733,60 +1739,70 @@ Rules:
     toDate: string,
     destination: string,
   ): Promise<ItineraryStopDto[]> {
+    const totalDays = calculateCalendarDays(fromDate, toDate);
     const itineraryText = this.extractSection(combinedPlan, 'itinerary');
-    if (!itineraryText) {
+    if (!itineraryText || itineraryText.trim().length === 0) {
       this.logger.log(`[Deterministic] No itinerary section found, using fallback stop for ${destination}`);
       return this.buildFallbackStop(destination, fromDate, toDate);
     }
 
-    // 1. Deterministic-first: Try fast regex extraction with comprehensive city keyword dictionary
-    const regexStops = this.regexExtractStops(itineraryText, fromDate, toDate, destination);
-    if (regexStops.length > 0 && !(regexStops.length === 1 && regexStops[0].city.toLowerCase() === destination.toLowerCase())) {
-      this.logger.log(`[Deterministic] Extracted ${regexStops.length} itinerary stops via regex: ${regexStops.map(s => s.city).join(', ')}`);
-      return regexStops;
+    const stops = this.regexExtractStops(itineraryText, fromDate, toDate, destination);
+    if (stops && stops.length > 0) {
+      this.logger.log(`[Deterministic] Extracted ${stops.length} itinerary stops across ${totalDays} days: ${stops.map(s => `${s.city} (${s.displayCheckin}→${s.displayCheckout})`).join(', ')}`);
+      return stops;
     }
 
-    // 2. Fallback to AI stop parser if regex extraction could not identify distinct stops
-    try {
-      this.logger.log(`[Internal Groq] Parsing itinerary stops via AI model...`);
-      const prompt = `You are a travel itinerary parser. Given the following day-by-day travel itinerary, extract each UNIQUE city/destination where the traveller will STAY OVERNIGHT (i.e., needs a hotel). Group consecutive days in the same city.
+    return this.buildFallbackStop(destination, fromDate, toDate);
+  }
 
-Trip start date: ${fromDate}
-Overall destination: ${destination}
+  private resolveGatewayCity(destination: string): string {
+    const COUNTRY_GATEWAYS: Record<string, string> = {
+      'netherlands': 'Amsterdam',
+      'holland': 'Amsterdam',
+      'thailand': 'Bangkok',
+      'vietnam': 'Hanoi',
+      'japan': 'Tokyo',
+      'indonesia': 'Bali',
+      'bali': 'Bali',
+      'maldives': 'Male',
+      'sri lanka': 'Colombo',
+      'nepal': 'Kathmandu',
+      'singapore': 'Singapore',
+      'malaysia': 'Kuala Lumpur',
+      'uae': 'Dubai',
+      'united arab emirates': 'Dubai',
+      'uk': 'London',
+      'united kingdom': 'London',
+      'england': 'London',
+      'france': 'Paris',
+      'italy': 'Rome',
+      'spain': 'Barcelona',
+      'germany': 'Frankfurt',
+      'switzerland': 'Zurich',
+      'austria': 'Vienna',
+      'czech republic': 'Prague',
+      'hungary': 'Budapest',
+      'greece': 'Athens',
+      'portugal': 'Lisbon',
+      'turkey': 'Istanbul',
+      'egypt': 'Cairo',
+      'usa': 'New York',
+      'united states': 'New York',
+      'australia': 'Sydney',
+      'new zealand': 'Auckland',
+      'south korea': 'Seoul',
+      'korea': 'Seoul',
+      'china': 'Beijing',
+      'india': 'Delhi',
+    };
 
-Itinerary:
-${itineraryText}
-
-Return a JSON array of objects with this schema:
-[
-  { "city": "City Name", "dayStart": 1, "dayEnd": 2 },
-  { "city": "Another City", "dayStart": 3, "dayEnd": 5 }
-]
-
-Rules:
-- If the overall destination is a country (e.g. "Thailand", "Vietnam", "Japan"), you MUST extract the actual distinct cities visited (e.g., "Bangkok", "Phuket", "Chiang Mai", "Hanoi", "Tokyo"). NEVER output country names as the city.
-- Only include cities where the traveller actually SLEEPS (needs a hotel/guesthouse). Exclude transit-only stops.
-- "city" must be the real geographic city/town name — NOT words like "Arrival", "Departure", "Leisure", "Exploration", "Rest", "Thailand", "Vietnam", "Japan", etc.
-- Group consecutive days spent in the same city into ONE entry.
-- Day numbers refer to the trip day (Day 1 = first day of trip).
-- If unsure about exact city, use the nearest well-known city.
-`;
-
-      const resultText = await this.callModelWithFallback(
-        prompt,
-        'You are a travel itinerary parser. Output strictly valid JSON.',
-        true
-      );
-      const clean = resultText.replace(/```json/gi, '').replace(/```/g, '').trim();
-      const parsed: Array<{ city: string; dayStart: number; dayEnd: number }> = JSON.parse(clean);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        return this.computeDates(parsed, fromDate);
+    const destLower = (destination || '').toLowerCase().trim();
+    for (const [country, city] of Object.entries(COUNTRY_GATEWAYS)) {
+      if (destLower === country || destLower.includes(country)) {
+        return city;
       }
-    } catch (e: any) {
-      this.logger.warn(`AI stop extraction failed: ${e.message}. Using regex stops fallback.`);
     }
-
-    return regexStops.length > 0 ? regexStops : this.regexExtractStops(itineraryText, fromDate, toDate, destination);
+    return destination ? (destination.charAt(0).toUpperCase() + destination.slice(1)) : 'Destination';
   }
 
   private regexExtractStops(
@@ -1795,7 +1811,10 @@ Rules:
     toDate: string,
     destination: string,
   ): ItineraryStopDto[] {
-    // Known city keywords for Himalayan and global trips
+    const totalDays = calculateCalendarDays(fromDate, toDate);
+    const defaultCity = this.resolveGatewayCity(destination);
+
+    // Known city keywords
     const CITY_KEYWORDS: Record<string, string> = {
       'bangkok': 'Bangkok', 'phuket': 'Phuket', 'chiang mai': 'Chiang Mai', 'krabi': 'Krabi',
       'pattaya': 'Pattaya', 'samui': 'Koh Samui', 'koh samui': 'Koh Samui', 'hua hin': 'Hua Hin',
@@ -1815,9 +1834,10 @@ Rules:
       'nyalam': 'Nyalam', 'saga': 'Saga', 'shigatse': 'Shigatse',
       'london': 'London', 'paris': 'Paris', 'rome': 'Rome', 'florence': 'Florence', 'venice': 'Venice', 'milan': 'Milan',
       'barcelona': 'Barcelona', 'madrid': 'Madrid', 'seville': 'Seville',
-      'amsterdam': 'Amsterdam', 'berlin': 'Berlin', 'munich': 'Munich', 'frankfurt': 'Frankfurt',
+      'amsterdam': 'Amsterdam', 'rotterdam': 'Rotterdam', 'hague': 'The Hague', 'the hague': 'The Hague', 'utrecht': 'Utrecht',
+      'berlin': 'Berlin', 'munich': 'Munich', 'frankfurt': 'Frankfurt', 'hamburg': 'Hamburg', 'cologne': 'Cologne',
       'zurich': 'Zurich', 'lucerne': 'Lucerne', 'interlaken': 'Interlaken', 'geneva': 'Geneva',
-      'vienna': 'Vienna', 'prague': 'Prague', 'budapest': 'Budapest',
+      'vienna': 'Vienna', 'salzburg': 'Salzburg', 'prague': 'Prague', 'budapest': 'Budapest',
       'dubai': 'Dubai', 'abu dhabi': 'Abu Dhabi', 'doha': 'Doha', 'istanbul': 'Istanbul', 'cappadocia': 'Cappadocia', 'cairo': 'Cairo',
       'sydney': 'Sydney', 'melbourne': 'Melbourne', 'brisbane': 'Brisbane', 'auckland': 'Auckland', 'queenstown': 'Queenstown',
       'new york': 'New York', 'los angeles': 'Los Angeles', 'chicago': 'Chicago', 'san francisco': 'San Francisco',
@@ -1829,167 +1849,114 @@ Rules:
       'beijing': 'Beijing', 'shanghai': 'Shanghai',
     };
 
-    // INVALID non-city and country words that regex/OpenRouter might incorrectly pick up
     const INVALID_CITIES = new Set([
       'arrival', 'departure', 'leisure', 'rest', 'acclimatization', 'exploration',
       'sightseeing', 'transfer', 'transit', 'journey', 'excursion', 'day',
       'return', 'welcome', 'farewell', 'flight', 'check', 'morning', 'evening',
       'thailand', 'vietnam', 'japan', 'indonesia', 'france', 'italy', 'spain', 'germany',
       'switzerland', 'india', 'nepal', 'maldives', 'sri lanka', 'singapore', 'malaysia',
-      'australia', 'united states', 'usa', 'uk', 'united kingdom', 'europe', 'asia',
+      'australia', 'united states', 'usa', 'uk', 'united kingdom', 'europe', 'asia', 'netherlands', 'holland',
     ]);
 
-    const rawDays: Array<{ day: number; city: string }> = [];
+    const parsedDays = parseItineraryDays(itineraryText);
+    const dayCities: string[] = [];
+    let currentCity = defaultCity;
 
-    for (const line of itineraryText.split('\n')) {
-      const clean = line.trim().replace(/[*_#]/g, '');
-      const match = clean.match(/^Day\s*(\d+)[:\s-]*(.*)/i);
-      if (!match) continue;
-      const dayNum = parseInt(match[1]);
-      const header = match[2].trim();
-      const lower = header.toLowerCase();
+    const sortedKeys = Object.keys(CITY_KEYWORDS).sort((a, b) => b.length - a.length);
 
-      let foundCity = '';
+    for (let d = 1; d <= totalDays; d++) {
+      const dayItem = parsedDays.find(p => p.day === d);
+      if (dayItem) {
+        const headerText = dayItem.title.toLowerCase();
+        let foundCity = '';
 
-      // 1. Check known city keywords (longest match first)
-      const sortedKeys = Object.keys(CITY_KEYWORDS).sort((a, b) => b.length - a.length);
-      for (const kw of sortedKeys) {
-        if (lower.includes(kw)) {
-          foundCity = CITY_KEYWORDS[kw];
-          break;
-        }
-      }
-
-      // 2. Preposition extraction: "to X", "in X", "at X", "arrive X"
-      if (!foundCity) {
-        const pm = header.match(/\b(?:in|to|at|arrive(?:d)?(?:\s+in)?|reach(?:ed)?|visiting)\s+([A-Z][a-zA-Z\s]+?)(?:\s*[&(,–\-]|$)/);
-        if (pm) {
-          const candidate = pm[1].trim().split(/\s+/).slice(0, 3).join(' ');
-          const lower2 = candidate.toLowerCase();
-          if (!INVALID_CITIES.has(lower2) && candidate.length > 2) {
-            foundCity = candidate;
+        // 1. Check known keywords in day header
+        for (const kw of sortedKeys) {
+          if (headerText.includes(kw)) {
+            foundCity = CITY_KEYWORDS[kw];
+            break;
           }
         }
+
+        // 2. Preposition extraction: "to X", "in X", "at X", "arrive X"
+        if (!foundCity) {
+          const pm = dayItem.title.match(/\b(?:in|to|at|arrive(?:d)?(?:\s+in)?|reach(?:ed)?|visiting)\s+([A-Z][a-zA-Z\s]+?)(?:\s*[&(,–\-]|$)/);
+          if (pm) {
+            const candidate = pm[1].trim().split(/\s+/).slice(0, 3).join(' ');
+            const lowerCandidate = candidate.toLowerCase();
+            if (!INVALID_CITIES.has(lowerCandidate) && candidate.length > 2) {
+              foundCity = candidate;
+            }
+          }
+        }
+
+        // 3. Check known keywords in activities if not found in header
+        if (!foundCity && dayItem.activities.length > 0) {
+          const actsText = dayItem.activities.slice(0, 2).join(' ').toLowerCase();
+          for (const kw of sortedKeys) {
+            if (actsText.includes(kw)) {
+              foundCity = CITY_KEYWORDS[kw];
+              break;
+            }
+          }
+        }
+
+        if (foundCity && !INVALID_CITIES.has(foundCity.toLowerCase())) {
+          currentCity = foundCity;
+        }
       }
-
-      // 3. Skip days without a valid city (don't fall back to generic words)
-      if (!foundCity || INVALID_CITIES.has(foundCity.toLowerCase())) continue;
-
-      rawDays.push({ day: dayNum, city: foundCity });
+      dayCities.push(currentCity);
     }
 
-    if (rawDays.length === 0) {
+    if (dayCities.length === 0) {
       return this.buildFallbackStop(destination, fromDate, toDate);
     }
 
-    // Group consecutive same-city days
+    // Group contiguous days in the same city
     const grouped: Array<{ city: string; dayStart: number; dayEnd: number }> = [];
-    for (const rd of rawDays) {
+    for (let i = 0; i < totalDays; i++) {
+      const city = dayCities[i] || defaultCity;
+      const dayNum = i + 1;
       const last = grouped[grouped.length - 1];
-      if (last && last.city.toLowerCase() === rd.city.toLowerCase()) {
-        last.dayEnd = rd.day;
+      if (last && last.city.toLowerCase() === city.toLowerCase()) {
+        last.dayEnd = dayNum;
       } else {
-        grouped.push({ city: rd.city, dayStart: rd.day, dayEnd: rd.day });
+        grouped.push({ city, dayStart: dayNum, dayEnd: dayNum });
       }
     }
 
-    return this.computeDates(grouped, fromDate);
-  }
-
-  private computeDates(
-    stops: Array<{ city: string; dayStart: number; dayEnd: number }>,
-    fromDate: string,
-  ): ItineraryStopDto[] {
-    const base = new Date(fromDate);
-    if (isNaN(base.getTime())) {
-      base.setTime(Date.now());
+    // Ensure final stop covers through totalDays
+    if (grouped.length > 0) {
+      grouped[grouped.length - 1].dayEnd = totalDays;
     }
 
-    return stops.map(s => {
-      const ci = new Date(base);
-      ci.setDate(base.getDate() + s.dayStart - 1);
-      const co = new Date(base);
-      co.setDate(base.getDate() + s.dayEnd);
-
-      const fmtISO = (d: Date) => {
-        const y = d.getFullYear();
-        const m = String(d.getMonth() + 1).padStart(2, '0');
-        const dd = String(d.getDate()).padStart(2, '0');
-        return `${y}-${m}-${dd}`;
-      };
-      const fmtDisplay = (d: Date) =>
-        d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
-
+    return grouped.map((g, idx) => {
+      const checkin = getDateForDay(fromDate, g.dayStart);
+      const checkout = idx === grouped.length - 1 ? toDate : getDateForDay(fromDate, g.dayEnd + 1);
       return {
-        city: s.city,
-        dayStart: s.dayStart,
-        dayEnd: s.dayEnd,
-        checkin: fmtISO(ci),
-        checkout: fmtISO(co),
-        displayCheckin: fmtDisplay(ci),
-        displayCheckout: fmtDisplay(co),
+        city: g.city,
+        dayStart: g.dayStart,
+        dayEnd: g.dayEnd,
+        checkin,
+        checkout,
+        displayCheckin: formatDayDateDisplay(checkin),
+        displayCheckout: formatDayDateDisplay(checkout),
       };
     });
   }
 
   public buildFallbackStop(destination: string, fromDate: string, toDate: string): ItineraryStopDto[] {
-    const COUNTRY_GATEWAYS: Record<string, string> = {
-      'thailand': 'Bangkok',
-      'vietnam': 'Hanoi',
-      'japan': 'Tokyo',
-      'indonesia': 'Bali',
-      'bali': 'Bali',
-      'maldives': 'Male',
-      'sri lanka': 'Colombo',
-      'nepal': 'Kathmandu',
-      'singapore': 'Singapore',
-      'malaysia': 'Kuala Lumpur',
-      'uae': 'Dubai',
-      'united arab emirates': 'Dubai',
-      'uk': 'London',
-      'united kingdom': 'London',
-      'france': 'Paris',
-      'italy': 'Rome',
-      'spain': 'Barcelona',
-      'germany': 'Frankfurt',
-      'switzerland': 'Zurich',
-      'usa': 'New York',
-      'united states': 'New York',
-      'australia': 'Sydney',
-      'south korea': 'Seoul',
-      'korea': 'Seoul',
-    };
-
-    const destLower = (destination || '').toLowerCase().trim();
-    let resolvedCity = destination;
-    for (const [country, city] of Object.entries(COUNTRY_GATEWAYS)) {
-      if (destLower === country || destLower.includes(country)) {
-        resolvedCity = city;
-        break;
-      }
-    }
-
-    const ci = new Date(fromDate || Date.now());
-    const co = new Date(toDate || Date.now());
-    if (isNaN(co.getTime())) co.setDate(ci.getDate() + 1);
-
-    const fmtISO = (d: Date) => {
-      const y = d.getFullYear();
-      const m = String(d.getMonth() + 1).padStart(2, '0');
-      const dd = String(d.getDate()).padStart(2, '0');
-      return `${y}-${m}-${dd}`;
-    };
-    const fmtDisplay = (d: Date) =>
-      d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+    const totalDays = calculateCalendarDays(fromDate, toDate);
+    const resolvedCity = this.resolveGatewayCity(destination);
 
     return [{
       city: resolvedCity,
       dayStart: 1,
-      dayEnd: 1,
-      checkin: fmtISO(ci),
-      checkout: fmtISO(co),
-      displayCheckin: fmtDisplay(ci),
-      displayCheckout: fmtDisplay(co),
+      dayEnd: totalDays,
+      checkin: fromDate,
+      checkout: toDate,
+      displayCheckin: formatDayDateDisplay(fromDate),
+      displayCheckout: formatDayDateDisplay(toDate),
     }];
   }
 
